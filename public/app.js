@@ -99,7 +99,7 @@ function connectSupabaseRealtime() {
         const payloadData = msg.payload;
         const ev = payloadData.event;
         const p = payloadData.payload;
-        if (!p) return;
+        if (!p && ev !== 'clear') return;
         
         if (ev === 'pixel') {
           applyRemotePixel(p.x, p.y, p.c);
@@ -149,14 +149,18 @@ function connectSupabaseRealtime() {
         } else if (ev === 'fill' && p) {
           executeFloodFill(p.x, p.y, p.c);
         } else if (ev === 'stamp_template' && p) {
-          const tpl = templates.find(t => t.id === p.id);
+          const tpl = templates.find(t => String(t.id) === String(p.id));
           if (tpl && tpl.rawIndices) {
             applyStampTemplate(tpl, p.x, p.y, p.filterCI);
           }
         } else if (ev === 'batch') {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
         } else if (ev === 'clear') {
-          if (canvasData) { canvasData.fill(0); offCtx.fillStyle='#FFFFFF'; offCtx.fillRect(0,0,CS,CS); markDirty(); }
+          if (canvasData) canvasData.fill(0);
+          offCtx.fillStyle = '#FFFFFF';
+          offCtx.fillRect(0, 0, CS, CS);
+          markDirty();
+          scheduleIDBSave();
         } else if (ev === 'template_add') {
           if (p.template && !templates.some(t => t.id === p.template.id)) {
             await addTemplateFromData(p.template);
@@ -597,8 +601,8 @@ let tplDragId = null, tplDragOX = 0, tplDragOY = 0;
 const $ = id => document.getElementById(id);
 const mainCanvas  = $('main-canvas');
 const ghostCanvas = $('ghost-canvas');
-const ctx         = mainCanvas.getContext('2d', { alpha: false, desynchronized: true });
-const ghostCtx    = ghostCanvas.getContext('2d', { desynchronized: true });
+const ctx         = mainCanvas.getContext('2d');
+const ghostCtx    = ghostCanvas.getContext('2d');
 const wrap        = $('canvas-wrap');
 
 /* === Utilities === */
@@ -940,22 +944,54 @@ function applyStampTemplate(tpl, startX, startY, filterCI) {
 function stampTemplate(tpl) {
   if (!tpl.confirmed || !tpl.rawIndices) return;
   const fci = (tpl.filterActive && tpl.filterCI >= 0) ? tpl.filterCI : -1;
+  const W = Math.round(tpl.w);
+  const H = Math.round(tpl.h);
+  const ox = Math.round(tpl.x);
+  const oy = Math.round(tpl.y);
+
   applyStampTemplate(tpl, tpl.x, tpl.y, fci);
 
-  // Broadcast lightweight stamp event (only 60 bytes, works instantly on all devices!)
+  // Collect flat pixels for guaranteed synchronization across all clients & server
+  const flat = [];
+  for (let py = 0; py < H; py++) {
+    const y = oy + py;
+    if (y < 0 || y >= CS) continue;
+    const tplRow = py * W;
+    for (let px = 0; px < W; px++) {
+      const x = ox + px;
+      if (x < 0 || x >= CS) continue;
+      const ci = tpl.rawIndices[tplRow + px];
+      if (ci < 0) continue;
+      if (fci >= 0 && ci !== fci) continue;
+      flat.push(x, y, ci);
+    }
+  }
+
   if (ws && ws.readyState === WebSocket.OPEN) {
+    // 1. Send lightweight stamp event for clients that have the template
     ws.send(JSON.stringify({
       topic: 'realtime:bplace',
       event: 'broadcast',
       payload: {
         type: 'broadcast',
         event: 'stamp_template',
-        payload: { id: tpl.id, x: Math.round(tpl.x), y: Math.round(tpl.y), filterCI: fci }
+        payload: { id: tpl.id, x: ox, y: oy, filterCI: fci }
       },
       ref: String(sbMsgRef++)
     }));
+
+    // 2. Stream flat_batch chunks to guarantee persistence and sync on all devices
+    for (let i = 0; i < flat.length; i += 30000) {
+      const chunk = flat.slice(i, i + 30000);
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
+        ref: String(sbMsgRef++)
+      }));
+    }
   }
-  showToast('Plantilla calcada y sincronizada al instante!', 'success');
+  showToast('Plantilla calcada y sincronizada (' + Math.round(flat.length / 3) + ' px)', 'success');
 }
 
 function confirmTemplate(tpl) {
@@ -1156,6 +1192,9 @@ function setCurrentColor(hex,addToRecent){
       markDirty();
     }
   });
+  if (!paintModeActive) {
+    activatePaintMode(tool || 'brush');
+  }
 }
 function setBgColor(hex){bgColorHex=hex;$('cur-bg-color').style.backgroundColor=hex;}
 function addToRecentColors(hex){hex=hex.toUpperCase();recentColors=recentColors.filter(c=>c!==hex);recentColors.unshift(hex);if(recentColors.length>MAX_RECENT)recentColors=recentColors.slice(0,MAX_RECENT);savePrefs();renderRecentColors();}
@@ -2007,9 +2046,22 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 
   $('btn-fit').addEventListener('click',fitCanvas);
-  $('btn-clear').addEventListener('click',()=>{if(!confirm('Limpiar todo el canvas?'))return;offCtx.fillStyle='#FFFFFF';offCtx.fillRect(0,0,CS,CS);if(canvasData)canvasData.fill(0);idbSave(canvasData);markDirty();showToast('Canvas limpiado','');
-    // Send clear message to all connected clients
-    if (wsReady) ws.send(JSON.stringify({ type: 'clear' }));
+  $('btn-clear').addEventListener('click', () => {
+    if (!confirm('Limpiar todo el canvas?')) return;
+    offCtx.fillStyle = '#FFFFFF';
+    offCtx.fillRect(0, 0, CS, CS);
+    if (canvasData) canvasData.fill(0);
+    idbSave(canvasData);
+    markDirty();
+    showToast('Canvas limpiado', '');
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: { type: 'broadcast', event: 'clear', payload: {} },
+        ref: String(sbMsgRef++)
+      }));
+    }
   });
   $('btn-export').addEventListener('click',()=>{$('export-info').textContent='Tamano: '+(CS*exportScale)+'x'+(CS*exportScale)+' px';$('export-dialog').classList.remove('hidden');});
   const bsIn = $('brush-size'); if (bsIn) bsIn.addEventListener('input', e => setBrushSize(parseInt(e.target.value)));
@@ -2073,8 +2125,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   setCurrentColor(currentColorHex,false);setBgColor(bgColorHex);
   setTool('brush');setBrushSize(1);setShapeFilled(true);
   $('canvas-size-display').textContent=CS+' x '+CS;
-  /* Start in navigation mode (paint mode OFF) */
-  wrap.className = 'cursor-pan';
+  const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  if (!isTouchDevice) {
+    activatePaintMode('brush');
+  } else {
+    deactivatePaintMode();
+  }
 
   fitCanvas();
   wsConnect();
