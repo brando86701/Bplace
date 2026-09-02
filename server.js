@@ -89,7 +89,7 @@ function supabaseRequest(endpoint, method = 'GET', data = null, isRaw = false) {
         path: url.pathname + url.search,
         method,
         headers,
-        timeout: 10000
+        timeout: 60000
       }, res => {
         const chunks = [];
         res.on('data', c => chunks.push(c));
@@ -219,17 +219,22 @@ async function syncFromSupabase() {
   }
 }
 
+let isUploadingToCloud = false;
+
 async function uploadCanvasToSupabase() {
-  if (!isCloudCanvasDirty) return;
+  if (!isCloudCanvasDirty || isUploadingToCloud) return;
+  isUploadingToCloud = true;
   isCloudCanvasDirty = false;
   try {
     const buf = Buffer.from(canvas.buffer, canvas.byteOffset, canvas.byteLength);
     const res = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', buf);
     if (res.status === 200 || res.status === 201) {
-      // Successfully uploaded to cloud
+      console.log('[Supabase] ✅ Lienzo guardado exitosamente en Storage CDN.');
     }
   } catch (err) {
-    console.warn('[Supabase] Error al subir canvas a Storage:', err.message);
+    console.warn('[Supabase] Aviso al sincronizar canvas con Storage:', err.message);
+  } finally {
+    isUploadingToCloud = false;
   }
 }
 
