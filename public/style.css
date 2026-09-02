@@ -1681,3 +1681,213 @@ body.paint-mode #wplace-dock {
     font-size: 13px;
   }
 }
+
+/* ════════════════════════════════════════════════════
+   COMPACT FLOATING TOP TEMPLATE ADJUSTMENT CARD
+   ════════════════════════════════════════════════════ */
+.tpl-adjust-card {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: calc(100% - 24px);
+  max-width: 390px;
+  background: var(--modal-bg);
+  backdrop-filter: blur(32px);
+  -webkit-backdrop-filter: blur(32px);
+  border: 1px solid var(--dock-border);
+  border-radius: 20px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  z-index: 250;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: adjustCardSlideDown 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+@keyframes adjustCardSlideDown {
+  from { opacity: 0; transform: translate(-50%, -20px) scale(0.96); }
+  to   { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
+.tpl-adjust-card.hidden {
+  display: none !important;
+}
+
+/* When adjusting template, hide paint dock, idle fab, and panel */
+body.adjusting-template #wplace-dock,
+body.adjusting-template #btn-pintar,
+body.adjusting-template #tpl-panel {
+  display: none !important;
+}
+
+.tac-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 10px 16px;
+  border-bottom: 1px solid var(--glass-border);
+  gap: 12px;
+}
+
+.tac-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tac-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tac-icon {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.tac-filename {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tac-dimensions {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text2);
+  margin-left: 22px;
+}
+
+.tac-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.tac-action-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.tac-btn-cancel {
+  background: var(--surface);
+  color: var(--text2);
+  border: 1px solid var(--glass-border);
+}
+
+.tac-btn-cancel:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.4);
+  transform: scale(1.06);
+}
+
+.tac-btn-confirm {
+  background: var(--accent-gradient);
+  color: #ffffff;
+  box-shadow: 0 4px 14px var(--accent-glow);
+}
+
+.tac-btn-confirm:hover {
+  transform: scale(1.08);
+  box-shadow: 0 6px 18px var(--accent-glow);
+}
+
+.tac-btn-confirm:active,
+.tac-btn-cancel:active {
+  transform: scale(0.94);
+}
+
+.tac-body {
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+}
+
+.tac-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tac-opacity-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+.tac-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+}
+
+.tac-slider {
+  flex: 1;
+  accent-color: var(--accent);
+  cursor: pointer;
+  height: 4px;
+}
+
+.tac-op-val {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+  min-width: 28px;
+  text-align: right;
+}
+
+.tac-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tac-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: var(--radius-full);
+  background: var(--surface-hover);
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.tac-pill-btn:hover {
+  background: var(--surface-active);
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.tac-hint {
+  font-size: 10.5px;
+  color: var(--text3);
+  text-align: center;
+  font-weight: 500;
+}

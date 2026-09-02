@@ -426,6 +426,9 @@ function debounceTemplateRestUpdate(tpl) {
 }
 
 function deleteTemplate(tplId) {
+  if (activeAdjustingTpl && activeAdjustingTpl.id === tplId) {
+    closeTemplateAdjustment();
+  }
   templates = templates.filter(t => t.id !== tplId);
   renderTemplateList();
   markDirty();
@@ -1010,80 +1013,94 @@ function nearestPaletteIndex(hex) {
 function markDirty() { dirty = true; if (!rafId) rafId = requestAnimationFrame(loop); }
 function loop()      { rafId = null; if (dirty) { dirty = false; render(); } }
 
-/* === Template canvas builders (Ultra-Fast Typed Memory) === */
-function makeStitchCanvas(rawIndices, W, H) {
-  // If template is large (>400x400), don't inflate to 4x VRAM (prevents mobile crashes)
-  if (W * H > 160000) {
-    return buildCanvasFromRawIndices(rawIndices, W, H);
-  }
-  const sc = document.createElement('canvas');
-  sc.width = W * STITCH_CELL; sc.height = H * STITCH_CELL;
-  const sctx = sc.getContext('2d');
-  const img = sctx.createImageData(sc.width, sc.height);
-  const u32 = new Uint32Array(img.data.buffer);
-  const sw = sc.width;
+/* === Template canvas builders & Guide Renderer === */
+function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
+  if (!tpl.rawIndices) return;
+  const tplW = Math.round(tpl.w);
+  const tplH = Math.round(tpl.h);
+  const ox = Math.round(tpl.x);
+  const oy = Math.round(tpl.y);
+  const filterCI = (tpl.filterActive && tpl.filterCI >= 0) ? tpl.filterCI : -1;
 
-  for (let py = 0; py < H; py++) {
-    const baseRow = py * STITCH_CELL + STITCH_GAP;
-    const endRow = (py + 1) * STITCH_CELL - STITCH_GAP;
-    const tplRow = py * W;
-    for (let px = 0; px < W; px++) {
-      const ci = rawIndices[tplRow + px];
-      if (ci < 0) continue;
-      const color32 = palUint32[ci] || 0xFF000000;
-      const baseCol = px * STITCH_CELL + STITCH_GAP;
-      const endCol = (px + 1) * STITCH_CELL - STITCH_GAP;
-      for (let r = baseRow; r < endRow; r++) {
-        const rowOffset = r * sw;
-        for (let c = baseCol; c < endCol; c++) {
-          u32[rowOffset + c] = color32;
+  if (vz >= 3) {
+    const startPX = Math.max(0, Math.floor(vx - ox));
+    const endPX   = Math.min(tplW, Math.ceil(vx + srcW - ox));
+    const startPY = Math.max(0, Math.floor(vy - oy));
+    const endPY   = Math.min(tplH, Math.ceil(vy + srcH - oy));
+
+    if (startPX >= endPX || startPY >= endPY) return;
+
+    for (let py = startPY; py < endPY; py++) {
+      const cy = oy + py;
+      if (cy < 0 || cy >= CS) continue;
+      const tplRow = py * tplW;
+      const canvasRow = cy * CS;
+
+      for (let px = startPX; px < endPX; px++) {
+        const ci = tpl.rawIndices[tplRow + px];
+        if (ci < 0) continue;
+        if (filterCI >= 0 && ci !== filterCI) continue;
+
+        const cx = ox + px;
+        if (cx < 0 || cx >= CS) continue;
+
+        // If pixel on canvas is already painted with the template's color,
+        // do not draw the template guide so the solid painted pixel shows completely filled!
+        if (canvasData && canvasData[canvasRow + cx] === ci) {
+          continue;
+        }
+
+        const sx = Math.round((cx - vx) * vz);
+        const sy = Math.round((cy - vy) * vz);
+        const ex = Math.round((cx + 1 - vx) * vz);
+        const ey = Math.round((cy + 1 - vy) * vz);
+        const pw = ex - sx;
+        const ph = ey - sy;
+        if (pw <= 0 || ph <= 0) continue;
+
+        // 1. Draw white background/border for template guide pixel
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(sx, sy, pw, ph);
+
+        // 2. Draw centered colored dot with white border
+        const marginX = Math.max(1, Math.round(pw * 0.22));
+        const marginY = Math.max(1, Math.round(ph * 0.22));
+        const dotW = pw - marginX * 2;
+        const dotH = ph - marginY * 2;
+
+        if (dotW > 0 && dotH > 0) {
+          ctx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+          ctx.fillRect(sx + marginX, sy + marginY, dotW, dotH);
         }
       }
     }
+  } else {
+    // Zoomed out (vz < 3): blit precomputed canvas directly
+    const tx = Math.round((ox - vx) * vz), ty = Math.round((oy - vy) * vz);
+    const tw = Math.round(tplW * vz),      th = Math.round(tplH * vz);
+    if (tpl.filterActive && tpl.filterCanvas) {
+      ctx.drawImage(tpl.filterCanvas, tx, ty, tw, th);
+    } else if (tpl.canvas) {
+      ctx.drawImage(tpl.canvas, tx, ty, tw, th);
+    }
   }
-  sctx.putImageData(img, 0, 0);
-  return sc;
+}
+
+function makeStitchCanvas(rawIndices, W, H) {
+  return buildCanvasFromRawIndices(rawIndices, W, H);
 }
 
 function makeFilterStitchCanvas(rawIndices, W, H, targetCI) {
-  if (W * H > 160000) {
-    const tmp = document.createElement('canvas');
-    tmp.width = W; tmp.height = H;
-    const tctx = tmp.getContext('2d'), img = tctx.createImageData(W, H);
-    const u32 = new Uint32Array(img.data.buffer);
-    const c32 = palUint32[targetCI] || 0xFF000000;
-    for (let i = 0; i < rawIndices.length; i++) {
-      if (rawIndices[i] === targetCI) u32[i] = c32;
-    }
-    tctx.putImageData(img, 0, 0);
-    return tmp;
-  }
-  const sc = document.createElement('canvas');
-  sc.width = W * STITCH_CELL; sc.height = H * STITCH_CELL;
-  const sctx = sc.getContext('2d');
-  const img = sctx.createImageData(sc.width, sc.height);
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d'), img = tctx.createImageData(W, H);
   const u32 = new Uint32Array(img.data.buffer);
-  const sw = sc.width;
-  const color32 = palUint32[targetCI] || 0xFF000000;
-
-  for (let py = 0; py < H; py++) {
-    const baseRow = py * STITCH_CELL + STITCH_GAP;
-    const endRow = (py + 1) * STITCH_CELL - STITCH_GAP;
-    const tplRow = py * W;
-    for (let px = 0; px < W; px++) {
-      if (rawIndices[tplRow + px] !== targetCI) continue;
-      const baseCol = px * STITCH_CELL + STITCH_GAP;
-      const endCol = (px + 1) * STITCH_CELL - STITCH_GAP;
-      for (let r = baseRow; r < endRow; r++) {
-        const rowOffset = r * sw;
-        for (let c = baseCol; c < endCol; c++) {
-          u32[rowOffset + c] = color32;
-        }
-      }
-    }
+  const c32 = palUint32[targetCI] || 0xFF000000;
+  for (let i = 0; i < rawIndices.length; i++) {
+    if (rawIndices[i] === targetCI) u32[i] = c32;
   }
-  sctx.putImageData(img, 0, 0);
-  return sc;
+  tctx.putImageData(img, 0, 0);
+  return tmp;
 }
 
 function buildPaletteCanvas(origImage, W, H) {
@@ -1237,6 +1254,7 @@ function confirmTemplate(tpl) {
     tpl.w = W; tpl.h = H;
     tpl.stitchCanvas = makeStitchCanvas(rawIndices, W, H);
     tpl.confirmed = true; tpl.filterActive = false; tpl.filterCI = -1; tpl.filterCanvas = null;
+    closeTemplateAdjustment();
     renderTemplateList(); markDirty();
     scheduleTemplateSave();
     sendTemplateUpdate(tpl); // Sync with other clients!
@@ -1314,14 +1332,8 @@ function render() {
       }
       ctx.imageSmoothingEnabled = false;
     } else {
-      // Confirmed template: blit pre-computed stitch/palette canvas directly via GPU (0ms CPU cost!)
-      if (tpl.filterActive && tpl.filterCanvas) {
-        ctx.drawImage(tpl.filterCanvas, tx, ty, tw, th);
-      } else if (tpl.stitchCanvas) {
-        ctx.drawImage(tpl.stitchCanvas, tx, ty, tw, th);
-      } else if (tpl.canvas) {
-        ctx.drawImage(tpl.canvas, tx, ty, tw, th);
-      }
+      // Confirmed template: render guide pixels with white borders, auto-clearing when painted
+      renderConfirmedTemplate(tpl, W, H, srcW, srcH);
     }
     ctx.globalAlpha = 1;
     ctx.strokeStyle = !tpl.confirmed ? 'rgba(255,220,50,.95)' : tpl.filterActive ? (tpl.filterCI >= 0 ? paletteHex[tpl.filterCI] : '#fff') : 'rgba(90,150,255,.5)';
@@ -1889,6 +1901,50 @@ function setBrushSize(s) {
   if (bsv) bsv.textContent = brushSize;
 }
 
+/* === Compact Top Template Adjustment Card State & Controller === */
+let activeAdjustingTpl = null;
+
+function openTemplateAdjustment(tpl) {
+  if (!tpl) return;
+  activeAdjustingTpl = tpl;
+  const nameEl = $('tac-filename');
+  const dimEl = $('tac-dimensions');
+  if (nameEl) nameEl.textContent = tpl.name || 'Plantilla';
+  if (dimEl) dimEl.textContent = Math.round(tpl.w) + ' × ' + Math.round(tpl.h) + ' píxeles';
+  
+  const opIn = $('tac-opacity-slider');
+  const opVal = $('tac-opacity-val');
+  if (opIn) opIn.value = tpl.opacity !== undefined ? tpl.opacity : 0.85;
+  if (opVal) opVal.textContent = Math.round((tpl.opacity !== undefined ? tpl.opacity : 0.85) * 100) + '%';
+  
+  // Hide large panel and exit paint mode so tools do not obstruct
+  const tplPanel = $('tpl-panel');
+  if (tplPanel) tplPanel.classList.add('hidden');
+  deactivatePaintMode();
+  
+  document.body.classList.add('adjusting-template');
+  const adjustCard = $('tpl-adjust-card');
+  if (adjustCard) adjustCard.classList.remove('hidden');
+  
+  markDirty();
+}
+
+function closeTemplateAdjustment() {
+  activeAdjustingTpl = null;
+  document.body.classList.remove('adjusting-template');
+  const adjustCard = $('tpl-adjust-card');
+  if (adjustCard) adjustCard.classList.add('hidden');
+  markDirty();
+}
+
+function updateAdjustCardDimensions(tpl) {
+  if (!tpl) return;
+  if (activeAdjustingTpl && activeAdjustingTpl.id === tpl.id) {
+    const dimEl = $('tac-dimensions');
+    if (dimEl) dimEl.textContent = Math.round(tpl.w) + ' × ' + Math.round(tpl.h) + ' píxeles';
+  }
+}
+
 /* === Template panel toggle (slide, not hide) === */
 function toggleTplPanel(){
   const panel=$('tpl-panel');
@@ -1948,13 +2004,8 @@ function loadTemplateFile(file) {
       markDirty();
       saveTemplatesToIDB();
 
-      // Open template panel if closed so user sees the size controls
-      const tplPanel = $('tpl-panel');
-      if (tplPanel) {
-        tplPanel.classList.remove('hidden');
-        tplPanel.classList.remove('collapsed');
-        updatePanelTabIcon();
-      }
+      // Open compact top floating adjustment card (hiding paint tools & big panel)
+      openTemplateAdjustment(tpl);
 
       const payloadTpl = {
         id: tpl.id,
@@ -2016,7 +2067,8 @@ function loadTemplateFile(file) {
 }
 
 function syncTplInputs(tpl){
-  const panel=$('tpl-panel');if(panel.classList.contains('collapsed'))return;
+  updateAdjustCardDimensions(tpl);
+  const panel=$('tpl-panel');if(!panel||panel.classList.contains('collapsed')||panel.classList.contains('hidden'))return;
   const idx=templates.findIndex(t=>t===tpl);
   const items=panel.querySelectorAll('.tpl-item');
   const item=items[idx];if(!item)return;
@@ -2056,25 +2108,12 @@ function renderTemplateList(){
           '</div>'+
         '</div>'+
         '<div class="tpl-item-controls">'+
-          '<div class="tpl-resize-hint">💡 Arrastra los círculos azules en el lienzo para ajustar o cambia valores:</div>'+
-          '<div class="tpl-pos-grid">'+
-            '<label><span class="lbl-tag">X</span><input type="number" class="tpl-x-inp" value="'+Math.round(tpl.x)+'" min="0" max="'+(CS-1)+'"></label>'+
-            '<label><span class="lbl-tag">Y</span><input type="number" class="tpl-y-inp" value="'+Math.round(tpl.y)+'" min="0" max="'+(CS-1)+'"></label>'+
-            '<label><span class="lbl-tag">Ancho</span><input type="number" class="tpl-w-inp" value="'+Math.round(tpl.w)+'" min="10" max="'+CS+'"></label>'+
-            '<label><span class="lbl-tag">Alto</span><input type="number" class="tpl-h-inp" value="'+Math.round(tpl.h)+'" min="10" max="'+CS+'"></label>'+
-          '</div>'+
-          '<div class="tpl-opacity-row">'+
-            '<span class="op-label">Opacidad</span>'+
-            '<input type="range" class="tpl-opacity-inp" min="0.1" max="1" step="0.05" value="'+tpl.opacity+'">'+
-            '<span class="tpl-opacity-val">'+Math.round(tpl.opacity*100)+'%</span>'+
-          '</div>'+
+          '<div class="tpl-resize-hint">💡 Arrastra los círculos azules en el lienzo para ajustar o usa el popup superior:</div>'+
+          '<button class="btn-confirm-tpl" data-act="adjust-card" style="margin-bottom:6px;background:var(--surface-hover);color:var(--text);border:1px solid var(--glass-border);">🔍 Ajustar en lienzo</button>'+
           '<button class="btn-confirm-tpl" data-act="confirm">✓ Confirmar Tamaño</button>'+
         '</div>';
+      div.querySelector('[data-act="adjust-card"]').addEventListener('click',()=>openTemplateAdjustment(tpl));
       div.querySelector('[data-act="confirm"]').addEventListener('click',()=>confirmTemplate(tpl));
-      div.querySelector('.tpl-x-inp').addEventListener('change',e=>{tpl.x=clamp(parseInt(e.target.value)||0,0,CS-10);markDirty();sendTemplateUpdate(tpl);});
-      div.querySelector('.tpl-y-inp').addEventListener('change',e=>{tpl.y=clamp(parseInt(e.target.value)||0,0,CS-10);markDirty();sendTemplateUpdate(tpl);});
-      div.querySelector('.tpl-w-inp').addEventListener('change',e=>{tpl.w=Math.max(10,parseInt(e.target.value)||10);markDirty();sendTemplateUpdate(tpl);});
-      div.querySelector('.tpl-h-inp').addEventListener('change',e=>{tpl.h=Math.max(10,parseInt(e.target.value)||10);markDirty();sendTemplateUpdate(tpl);});
     } else {
       div.innerHTML=
         '<div class="tpl-item-main">'+
@@ -2294,6 +2333,91 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  /* === Top Template Adjustment Card Event Listeners === */
+  const tacBtnConfirm = $('tac-btn-confirm');
+  if (tacBtnConfirm) {
+    tacBtnConfirm.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (activeAdjustingTpl) {
+        confirmTemplate(activeAdjustingTpl);
+      }
+    });
+  }
+
+  const tacBtnCancel = $('tac-btn-cancel');
+  if (tacBtnCancel) {
+    tacBtnCancel.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (activeAdjustingTpl) {
+        const tplToDel = activeAdjustingTpl;
+        closeTemplateAdjustment();
+        deleteTemplate(tplToDel.id);
+        showToast('Plantilla cancelada', '');
+      }
+    });
+  }
+
+  const tacOpacityIn = $('tac-opacity-slider');
+  const tacOpacityVal = $('tac-opacity-val');
+  if (tacOpacityIn) {
+    tacOpacityIn.addEventListener('input', (e) => {
+      if (activeAdjustingTpl) {
+        activeAdjustingTpl.opacity = parseFloat(e.target.value);
+        if (tacOpacityVal) tacOpacityVal.textContent = Math.round(activeAdjustingTpl.opacity * 100) + '%';
+        markDirty();
+      }
+    });
+    tacOpacityIn.addEventListener('change', () => {
+      if (activeAdjustingTpl) {
+        scheduleTemplateSave();
+        sendTemplateUpdate(activeAdjustingTpl);
+      }
+    });
+  }
+
+  const tacBtnCenter = $('tac-btn-center');
+  if (tacBtnCenter) {
+    tacBtnCenter.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (activeAdjustingTpl) {
+        const viewW = mainCanvas.width / vz;
+        const viewH = mainCanvas.height / vz;
+        activeAdjustingTpl.x = Math.round(clamp(vx + (viewW - activeAdjustingTpl.w) / 2, 0, CS - activeAdjustingTpl.w));
+        activeAdjustingTpl.y = Math.round(clamp(vy + (viewH - activeAdjustingTpl.h) / 2, 0, CS - activeAdjustingTpl.h));
+        updateAdjustCardDimensions(activeAdjustingTpl);
+        markDirty();
+        sendTemplateUpdate(activeAdjustingTpl);
+        showToast('Plantilla centrada', '');
+      }
+    });
+  }
+
+  const tacBtnFit = $('tac-btn-fit');
+  if (tacBtnFit) {
+    tacBtnFit.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (activeAdjustingTpl) {
+        const viewW = mainCanvas.width / vz;
+        const viewH = mainCanvas.height / vz;
+        const maxInitialDim = Math.min(800, Math.round(Math.min(viewW, viewH) * 0.75));
+        const aspect = activeAdjustingTpl.w / activeAdjustingTpl.h;
+        if (aspect >= 1) {
+          activeAdjustingTpl.w = maxInitialDim;
+          activeAdjustingTpl.h = Math.max(10, Math.round(maxInitialDim / aspect));
+        } else {
+          activeAdjustingTpl.h = maxInitialDim;
+          activeAdjustingTpl.w = Math.max(10, Math.round(maxInitialDim * aspect));
+        }
+        activeAdjustingTpl.x = Math.round(clamp(vx + (viewW - activeAdjustingTpl.w) / 2, 0, CS - activeAdjustingTpl.w));
+        activeAdjustingTpl.y = Math.round(clamp(vy + (viewH - activeAdjustingTpl.h) / 2, 0, CS - activeAdjustingTpl.h));
+        updateAdjustCardDimensions(activeAdjustingTpl);
+        markDirty();
+        sendTemplateUpdate(activeAdjustingTpl);
+        showToast('Tamaño ajustado', '');
+      }
+    });
+  }
+
   $('btn-fit').addEventListener('click',fitCanvas);
   $('btn-clear').addEventListener('click', async () => {
     if (!confirm('¿Limpiar todo el canvas? Esta acción borrará el lienzo para todos.')) return;
@@ -2488,7 +2612,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   let touchState = null, lastPinchDist = 0;
 
   const handleTouchStart = (e) => {
-    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg')) {
+    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
       return;
     }
     e.preventDefault();
@@ -2499,7 +2623,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       const sx = t.clientX - rect.left, sy = t.clientY - rect.top;
       const {x, y} = s2c(sx, sy);
       
-      // Check template resize handles on mobile
+      // 1. Check template resize handles on mobile
       const hit = hitTestHandles(sx, sy);
       if (hit) {
         touchState = { 
@@ -2512,22 +2636,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         return;
       }
       
-      // If NOT in paint mode, single touch always pans
-      if (!paintModeActive) {
-        touchState = { 
-          type: 'pan-or-tap', 
-          rect,
-          startClientX: t.clientX, 
-          startClientY: t.clientY, 
-          lastClientX: t.clientX, 
-          lastClientY: t.clientY, 
-          hasMoved: true, // treat as pan, never tap-to-paint
-          sx, sy 
-        };
-        return;
-      }
-      
-      // Check template body drag on mobile
+      // 2. Check template body drag on mobile
       for (let i = templates.length - 1; i >= 0; i--) {
         const tpl = templates[i];
         if (tpl.confirmed || !tpl.visible) continue;
@@ -2541,6 +2650,21 @@ window.addEventListener('DOMContentLoaded', async () => {
           };
           return;
         }
+      }
+      
+      // 3. If NOT in paint mode, single touch always pans
+      if (!paintModeActive) {
+        touchState = { 
+          type: 'pan-or-tap', 
+          rect,
+          startClientX: t.clientX, 
+          startClientY: t.clientY, 
+          lastClientX: t.clientX, 
+          lastClientY: t.clientY, 
+          hasMoved: true, // treat as pan, never tap-to-paint
+          sx, sy 
+        };
+        return;
       }
       
       if (!canvasLocked) {
@@ -2582,7 +2706,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   const handleTouchMove = (e) => {
     if (!touchState) return;
-    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg')) {
+    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
       return;
     }
     e.preventDefault();
