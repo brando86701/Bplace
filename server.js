@@ -536,6 +536,55 @@ function connectServerToSupabaseRealtime() {
               broadcast({ type: 'pixel', x: p.x, y: p.y, c: p.c });
               scheduleSaveCanvas();
             }
+          } else if (ev === 'shape' && p) {
+            if (p.type === 'rect') {
+              const lx = Math.max(0, Math.min(p.x0, p.x1));
+              const rx = Math.min(CANVAS_SIZE - 1, Math.max(p.x0, p.x1));
+              const ty = Math.max(0, Math.min(p.y0, p.y1));
+              const by = Math.min(CANVAS_SIZE - 1, Math.max(p.y0, p.y1));
+              const w = rx - lx + 1;
+              if (p.fill) {
+                for (let y = ty; y <= by; y++) {
+                  const rowOffset = y * CANVAS_SIZE + lx;
+                  canvas.fill(p.c, rowOffset, rowOffset + w);
+                }
+              } else {
+                for (let x = lx; x <= rx; x++) {
+                  canvas[ty * CANVAS_SIZE + x] = p.c;
+                  canvas[by * CANVAS_SIZE + x] = p.c;
+                }
+                for (let y = ty + 1; y < by; y++) {
+                  canvas[y * CANVAS_SIZE + lx] = p.c;
+                  canvas[y * CANVAS_SIZE + rx] = p.c;
+                }
+              }
+            } else if (p.type === 'circle') {
+              const cx = p.cx, cy = p.cy, a = Math.max(0, p.a), b = Math.max(0, p.b), ci = p.c;
+              if (p.fill) {
+                for (let dy = -b; dy <= b; dy++) {
+                  const py = cy + dy;
+                  if (py < 0 || py >= CANVAS_SIZE) continue;
+                  const xs = Math.round(a * Math.sqrt(Math.max(0, 1 - (dy * dy) / (b * b + 0.0001))));
+                  const lx = Math.max(0, cx - xs);
+                  const rx = Math.min(CANVAS_SIZE - 1, cx + xs);
+                  const w = rx - lx + 1;
+                  if (w > 0) {
+                    const rowOffset = py * CANVAS_SIZE + lx;
+                    canvas.fill(ci, rowOffset, rowOffset + w);
+                  }
+                }
+              }
+            }
+            scheduleSaveCanvas();
+          } else if (ev === 'flat_batch' && Array.isArray(p)) {
+            const len = p.length;
+            for (let i = 0; i < len; i += 3) {
+              const x = p[i], y = p[i + 1], ci = p[i + 2];
+              if (x >= 0 && x < CANVAS_SIZE && y >= 0 && y < CANVAS_SIZE && ci >= 0 && ci < PALETTE.length) {
+                canvas[y * CANVAS_SIZE + x] = ci;
+              }
+            }
+            scheduleSaveCanvas();
           } else if (ev === 'batch' && p && Array.isArray(p.pixels)) {
             p.pixels.forEach(px => {
               if (px.x >= 0 && px.x < CANVAS_SIZE && px.y >= 0 && px.y < CANVAS_SIZE && px.c >= 0 && px.c < PALETTE.length) {

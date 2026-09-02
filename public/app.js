@@ -103,6 +103,31 @@ function connectSupabaseRealtime() {
         
         if (ev === 'pixel') {
           applyRemotePixel(p.x, p.y, p.c);
+        } else if (ev === 'shape') {
+          if (p.type === 'rect') {
+            paintRect(p.x0, p.y0, p.x1, p.y1, p.c, p.fill);
+          } else if (p.type === 'circle') {
+            paintEllipse(p.cx, p.cy, p.a, p.b, p.c, p.fill);
+          } else if (p.type === 'line') {
+            const prev = brushSize;
+            brushSize = p.size || 1;
+            bresenhamLine(p.x0, p.y0, p.x1, p.y1, (x, y) => paintBrush(x, y, p.c));
+            brushSize = prev;
+          }
+          markDirty();
+          scheduleIDBSave();
+        } else if (ev === 'flat_batch' && Array.isArray(p)) {
+          const len = p.length;
+          for (let i = 0; i < len; i += 3) {
+            const x = p[i], y = p[i + 1], ci = p[i + 2];
+            if (x >= 0 && x < CS && y >= 0 && y < CS && ci >= 0 && ci < palRGB.length) {
+              offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+              offCtx.fillRect(x, y, 1, 1);
+              if (canvasData) canvasData[y * CS + x] = ci;
+            }
+          }
+          markDirty();
+          scheduleIDBSave();
         } else if (ev === 'batch') {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
         } else if (ev === 'clear') {
@@ -153,11 +178,21 @@ function wsConnect() {
   connectSupabaseRealtime();
 }
 
+function sendWSShape(shapeData) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    topic: 'realtime:bplace',
+    event: 'broadcast',
+    payload: { type: 'broadcast', event: 'shape', payload: shapeData },
+    ref: String(sbMsgRef++)
+  }));
+}
+
 function queueWSPixel(x, y, ci) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   wsBatch.push({ x, y, c: ci });
   if (!wsFlushTimer) {
-    wsFlushTimer = setTimeout(flushWSPixels, 25);
+    wsFlushTimer = setTimeout(flushWSPixels, 20);
   }
 }
 
@@ -170,16 +205,23 @@ function flushWSPixels() {
         ws.send(JSON.stringify({
           topic: 'realtime:bplace',
           event: 'broadcast',
-          payload: { type: 'broadcast', event: 'pixel', payload: { x: wsBatch[0].x, y: wsBatch[0].y, c: wsBatch[0].c } },
+          payload: { type: 'broadcast', event: 'pixel', payload: wsBatch[0] },
           ref: String(sbMsgRef++)
         }));
       } else {
-        for (let i = 0; i < wsBatch.length; i += 500) {
-          const chunk = wsBatch.slice(i, i + 500);
+        const flat = new Array(wsBatch.length * 3);
+        for (let i = 0; i < wsBatch.length; i++) {
+          const idx = i * 3;
+          flat[idx] = wsBatch[i].x;
+          flat[idx + 1] = wsBatch[i].y;
+          flat[idx + 2] = wsBatch[i].c;
+        }
+        for (let i = 0; i < flat.length; i += 6000) {
+          const chunk = flat.slice(i, i + 6000);
           ws.send(JSON.stringify({
             topic: 'realtime:bplace',
             event: 'broadcast',
-            payload: { type: 'broadcast', event: 'batch', payload: { pixels: chunk } },
+            payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
             ref: String(sbMsgRef++)
           }));
         }
@@ -983,70 +1025,83 @@ function updateHover(sx, sy) {
 function floodFill(sx,sy,newHex){if(!canvasData)return;const ni=nearestPaletteIndex(newHex);const idx0=sy*CS+sx;const oi=canvasData[idx0];if(oi===ni)return;const q=[idx0],v=new Uint8Array(CS*CS);v[idx0]=1;while(q.length){const ci=q.pop(),cx=ci%CS;canvasData[ci]=ni;offCtx.putImageData(PAL_ID[ni],cx,Math.floor(ci/CS));for(const nn of[ci-1,ci+1,ci-CS,ci+CS]){if(nn<0||nn>=CS*CS||v[nn])continue;if(Math.abs((nn%CS)-cx)>1)continue;if(canvasData[nn]===oi){v[nn]=1;q.push(nn);}}}markDirty();scheduleIDBSave();}
 function bresenhamLine(x0,y0,x1,y1,fn){const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let err=dx-dy;for(;;){fn(x0,y0);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-dy){err-=dy;x0+=sx;}if(e2<dx){err+=dx;y0+=sy;}}}
 function paintBrush(cx,cy,ci){const r=Math.floor(brushSize/2);if(brushSize===1){if(inCanvas(cx,cy))setPixelPalette(cx,cy,ci);return;}for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){const px=cx+dx,py=cy+dy;if(inCanvas(px,py))setPixelPalette(px,py,ci);}}
-function paintRect(x0,y0,x1,y1,ci,f,pts){
-  const lx=Math.min(x0,x1),rx=Math.max(x0,x1),ty=Math.min(y0,y1),by=Math.max(y0,y1);
-  const drawPixel = (x, y) => {
-    if (inCanvas(x, y)) {
-      setPixelPalette(x, y, ci);
-      if (pts) pts.push({ x, y, c: ci });
+function paintRect(x0, y0, x1, y1, ci, f) {
+  const lx = Math.max(0, Math.min(x0, x1));
+  const rx = Math.min(CS - 1, Math.max(x0, x1));
+  const ty = Math.max(0, Math.min(y0, y1));
+  const by = Math.min(CS - 1, Math.max(y0, y1));
+  const w = rx - lx + 1;
+  const h = by - ty + 1;
+  if (w <= 0 || h <= 0) return;
+
+  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  if (f) {
+    offCtx.fillRect(lx, ty, w, h);
+    if (canvasData) {
+      for (let y = ty; y <= by; y++) {
+        const rowOffset = y * CS + lx;
+        canvasData.fill(ci, rowOffset, rowOffset + w);
+      }
     }
-  };
-  if(f){
-    for(let y=ty;y<=by;y++)for(let x=lx;x<=rx;x++)drawPixel(x, y);
-  }else{
-    for(let x=lx;x<=rx;x++){
-      drawPixel(x, ty);
-      drawPixel(x, by);
-    }
-    for(let y=ty+1;y<by;y++){
-      drawPixel(lx, y);
-      drawPixel(rx, y);
+  } else {
+    offCtx.fillRect(lx, ty, w, 1);
+    offCtx.fillRect(lx, by, w, 1);
+    offCtx.fillRect(lx, ty, 1, h);
+    offCtx.fillRect(rx, ty, 1, h);
+    if (canvasData) {
+      for (let x = lx; x <= rx; x++) {
+        canvasData[ty * CS + x] = ci;
+        canvasData[by * CS + x] = ci;
+      }
+      for (let y = ty + 1; y < by; y++) {
+        canvasData[y * CS + lx] = ci;
+        canvasData[y * CS + rx] = ci;
+      }
     }
   }
 }
-function paintEllipse(cx,cy,a,b,ci,f,pts){
-  a=Math.max(0,a);b=Math.max(0,b);
-  const drawPixel = (ex, ey) => {
-    if (inCanvas(ex, ey)) {
-      setPixelPalette(ex, ey, ci);
-      if (pts) pts.push({ x: ex, y: ey, c: ci });
-    }
-  };
-  if(f){
-    for(let dy=-b;dy<=b;dy++){
-      const py=cy+dy;
-      if(py<0||py>=CS)continue;
-      const xs=Math.round(a*Math.sqrt(Math.max(0,1-(dy*dy)/(b*b+.0001))));
-      for(let dx=-xs;dx<=xs;dx++){
-        drawPixel(cx+dx, py);
+
+function paintEllipse(cx, cy, a, b, ci, f) {
+  a = Math.max(0, a); b = Math.max(0, b);
+  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  if (f) {
+    for (let dy = -b; dy <= b; dy++) {
+      const py = cy + dy;
+      if (py < 0 || py >= CS) continue;
+      const xs = Math.round(a * Math.sqrt(Math.max(0, 1 - (dy * dy) / (b * b + 0.0001))));
+      const lx = Math.max(0, cx - xs);
+      const rx = Math.min(CS - 1, cx + xs);
+      const w = rx - lx + 1;
+      if (w > 0) {
+        offCtx.fillRect(lx, py, w, 1);
+        if (canvasData) {
+          const rowOffset = py * CS + lx;
+          canvasData.fill(ci, rowOffset, rowOffset + w);
+        }
       }
     }
-  }else{
-    let x=0,y=b,d1=(b*b)-(a*a*b)+.25*a*a,ddx=0,ddy=2*a*a*b;
-    const p4=(px,py)=>{
-      [[cx+px,cy+py],[cx-px,cy+py],[cx+px,cy-py],[cx-px,cy-py]].forEach(([ex,ey])=>{
-        drawPixel(ex, ey);
-      });
+  } else {
+    const drawPixel = (ex, ey) => {
+      if (inCanvas(ex, ey)) setPixelPalette(ex, ey, ci);
     };
-    while(ddx<ddy){
-      p4(x,y);
-      if(d1<0){
-        x++;ddx+=2*b*b;d1+=ddx+b*b;
-      }else{
-        x++;y--;ddx+=2*b*b;ddy-=2*a*a;d1+=ddx-ddy+b*b;
-      }
+    let x = 0, y = b, d1 = (b * b) - (a * a * b) + 0.25 * a * a, ddx = 0, ddy = 2 * a * a * b;
+    const p4 = (px, py) => {
+      [[cx + px, cy + py], [cx - px, cy + py], [cx + px, cy - py], [cx - px, cy - py]].forEach(([ex, ey]) => drawPixel(ex, ey));
+    };
+    while (ddx < ddy) {
+      p4(x, y);
+      if (d1 < 0) { x++; ddx += 2 * b * b; d1 += ddx + b * b; }
+      else { x++; y--; ddx += 2 * b * b; ddy -= 2 * a * a; d1 += ddx - ddy + b * b; }
     }
-    let d2=(b*b)*(x+.5)*(x+.5)+(a*a)*(y-1)*(y-1)-(a*a*b*b);
-    while(y>=0){
-      p4(x,y);
-      if(d2>0){
-        y--;ddy-=2*a*a;d2+=a*a-ddy;
-      }else{
-        x++;y--;ddx+=2*b*b;ddy-=2*a*a;d2+=ddx-ddy+a*a;
-      }
+    let d2 = (b * b) * (x + 0.5) * (x + 0.5) + (a * a) * (y - 1) * (y - 1) - (a * a * b * b);
+    while (y >= 0) {
+      p4(x, y);
+      if (d2 > 0) { y--; ddy -= 2 * a * a; d2 += a * a - ddy; }
+      else { x++; y--; ddx += 2 * b * b; ddy -= 2 * a * a; d2 += ddx - ddy + a * a; }
     }
   }
 }
+
 function paintPixelMain(x, y) {
   if (!inCanvas(x, y)) return;
   const ci = currentPaletteCI;
@@ -1066,15 +1121,20 @@ function paintLineMain(x0, y0, x1, y1) {
 
 function commitShape(x0, y0, x1, y1) {
   const ci = currentPaletteCI;
-  const pts = [];
-  if (tool === 'line')
-    bresenhamLine(x0, y0, x1, y1, (x, y) => { if (inCanvas(x, y)) { setPixelPalette(x, y, ci); queueWSPixel(x, y, ci); } });
-  else if (tool === 'rect')
-    paintRect(x0, y0, x1, y1, ci, shapeFilled, pts);
-  else if (tool === 'circle')
-    paintEllipse(Math.round((x0 + x1) / 2), Math.round((y0 + y1) / 2), Math.round(Math.abs(x1 - x0) / 2), Math.round(Math.abs(y1 - y0) / 2), ci, shapeFilled, pts);
-  
-  if (pts.length) pts.forEach(p => queueWSPixel(p.x, p.y, p.c));
+  if (tool === 'rect') {
+    paintRect(x0, y0, x1, y1, ci, shapeFilled);
+    sendWSShape({ type: 'rect', x0, y0, x1, y1, c: ci, fill: shapeFilled });
+  } else if (tool === 'circle') {
+    const cx = Math.round((x0 + x1) / 2);
+    const cy = Math.round((y0 + y1) / 2);
+    const a = Math.round(Math.abs(x1 - x0) / 2);
+    const b = Math.round(Math.abs(y1 - y0) / 2);
+    paintEllipse(cx, cy, a, b, ci, shapeFilled);
+    sendWSShape({ type: 'circle', cx, cy, a, b, c: ci, fill: shapeFilled });
+  } else if (tool === 'line') {
+    paintLineMain(x0, y0, x1, y1);
+    sendWSShape({ type: 'line', x0, y0, x1, y1, c: ci, size: brushSize });
+  }
   markDirty();
   scheduleIDBSave();
   flushWSPixels();
