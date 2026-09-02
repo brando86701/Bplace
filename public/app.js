@@ -146,6 +146,13 @@ function connectSupabaseRealtime() {
           brushSize = prev;
           markDirty();
           scheduleIDBSave();
+        } else if (ev === 'fill' && p) {
+          executeFloodFill(p.x, p.y, p.c);
+        } else if (ev === 'stamp_template' && p) {
+          const tpl = templates.find(t => t.id === p.id);
+          if (tpl && tpl.rawIndices) {
+            applyStampTemplate(tpl, p.x, p.y, p.filterCI);
+          }
         } else if (ev === 'batch') {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
         } else if (ev === 'clear') {
@@ -438,6 +445,8 @@ async function loadTemplatesFromCloud() {
         const loadedList = [];
         for (let i = 0; i < data.length; i++) {
           const t = data[i];
+          // Yield to event loop between templates so UI / zoom / pan never freezes!
+          await new Promise(r => setTimeout(r, 0));
           await addTemplateFromData({
             id: Number(t.id),
             name: t.name,
@@ -743,22 +752,23 @@ function setPixelPalette(x, y, ci) {
   offCtx.fillRect(x, y, 1, 1);
   if (canvasData) canvasData[y * CS + x] = ci;
 }
-/* Perceptual Redmean color distance for human visual color matching */
-function colorDistanceRedmean(r1, g1, b1, r2, g2, b2) {
-  const rmean = (r1 + r2) / 2;
-  const dr = r1 - r2;
-  const dg = g1 - g2;
-  const db = b1 - b2;
-  return (2 + rmean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rmean) / 256) * db * db;
-}
+/* 15-bit High-Speed Color Quantization Cache (32,768 entries = 64KB RAM) */
+const rgb15Cache = new Int16Array(32768).fill(-1);
 
 function nearestPaletteIndexRGB(r, g, b) {
+  const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+  const cached = rgb15Cache[key];
+  if (cached !== -1) return cached;
+
   let best = 0, bestD = Infinity;
   for (let p = 0; p < palRGB.length; p++) {
     const [pr, pg, pb] = palRGB[p];
-    const d = colorDistanceRedmean(r, g, b, pr, pg, pb);
+    const rmean = (r + pr) >> 1;
+    const dr = r - pr, dg = g - pg, db = b - pb;
+    const d = (((512 + rmean) * dr * dr) >> 8) + 4 * dg * dg + (((767 - rmean) * db * db) >> 8);
     if (d < bestD) { bestD = d; best = p; }
   }
+  rgb15Cache[key] = best;
   return best;
 }
 
@@ -770,103 +780,182 @@ function nearestPaletteIndex(hex) {
 function markDirty() { dirty = true; if (!rafId) rafId = requestAnimationFrame(loop); }
 function loop()      { rafId = null; if (dirty) { dirty = false; render(); } }
 
-/* === Template canvas builders === */
+/* === Template canvas builders (Ultra-Fast Typed Memory) === */
 function makeStitchCanvas(rawIndices, W, H) {
+  // If template is large (>400x400), don't inflate to 4x VRAM (prevents mobile crashes)
+  if (W * H > 160000) {
+    return buildCanvasFromRawIndices(rawIndices, W, H);
+  }
   const sc = document.createElement('canvas');
   sc.width = W * STITCH_CELL; sc.height = H * STITCH_CELL;
   const sctx = sc.getContext('2d');
+  const img = sctx.createImageData(sc.width, sc.height);
+  const u32 = new Uint32Array(img.data.buffer);
+  const sw = sc.width;
+
   for (let py = 0; py < H; py++) {
+    const baseRow = py * STITCH_CELL + STITCH_GAP;
+    const endRow = (py + 1) * STITCH_CELL - STITCH_GAP;
+    const tplRow = py * W;
     for (let px = 0; px < W; px++) {
-      const ci = rawIndices[py * W + px];
+      const ci = rawIndices[tplRow + px];
       if (ci < 0) continue;
-      const [r, g, b] = palRGB[ci];
-      sctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
-      sctx.fillRect(px*STITCH_CELL+STITCH_GAP, py*STITCH_CELL+STITCH_GAP, STITCH_CELL-2*STITCH_GAP, STITCH_CELL-2*STITCH_GAP);
+      const color32 = palUint32[ci] || 0xFF000000;
+      const baseCol = px * STITCH_CELL + STITCH_GAP;
+      const endCol = (px + 1) * STITCH_CELL - STITCH_GAP;
+      for (let r = baseRow; r < endRow; r++) {
+        const rowOffset = r * sw;
+        for (let c = baseCol; c < endCol; c++) {
+          u32[rowOffset + c] = color32;
+        }
+      }
     }
   }
+  sctx.putImageData(img, 0, 0);
   return sc;
 }
+
 function makeFilterStitchCanvas(rawIndices, W, H, targetCI) {
+  if (W * H > 160000) {
+    const tmp = document.createElement('canvas');
+    tmp.width = W; tmp.height = H;
+    const tctx = tmp.getContext('2d'), img = tctx.createImageData(W, H);
+    const u32 = new Uint32Array(img.data.buffer);
+    const c32 = palUint32[targetCI] || 0xFF000000;
+    for (let i = 0; i < rawIndices.length; i++) {
+      if (rawIndices[i] === targetCI) u32[i] = c32;
+    }
+    tctx.putImageData(img, 0, 0);
+    return tmp;
+  }
   const sc = document.createElement('canvas');
   sc.width = W * STITCH_CELL; sc.height = H * STITCH_CELL;
   const sctx = sc.getContext('2d');
-  const [r, g, b] = palRGB[targetCI] || [0,0,0];
-  sctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+  const img = sctx.createImageData(sc.width, sc.height);
+  const u32 = new Uint32Array(img.data.buffer);
+  const sw = sc.width;
+  const color32 = palUint32[targetCI] || 0xFF000000;
+
   for (let py = 0; py < H; py++) {
+    const baseRow = py * STITCH_CELL + STITCH_GAP;
+    const endRow = (py + 1) * STITCH_CELL - STITCH_GAP;
+    const tplRow = py * W;
     for (let px = 0; px < W; px++) {
-      if (rawIndices[py*W+px] !== targetCI) continue;
-      sctx.fillRect(px*STITCH_CELL+STITCH_GAP, py*STITCH_CELL+STITCH_GAP, STITCH_CELL-2*STITCH_GAP, STITCH_CELL-2*STITCH_GAP);
+      if (rawIndices[tplRow + px] !== targetCI) continue;
+      const baseCol = px * STITCH_CELL + STITCH_GAP;
+      const endCol = (px + 1) * STITCH_CELL - STITCH_GAP;
+      for (let r = baseRow; r < endRow; r++) {
+        const rowOffset = r * sw;
+        for (let c = baseCol; c < endCol; c++) {
+          u32[rowOffset + c] = color32;
+        }
+      }
     }
   }
+  sctx.putImageData(img, 0, 0);
   return sc;
 }
+
 function buildPaletteCanvas(origImage, W, H) {
   const tmp = document.createElement('canvas');
   tmp.width = W; tmp.height = H;
   const tctx = tmp.getContext('2d');
   tctx.imageSmoothingEnabled = true; tctx.imageSmoothingQuality = 'high';
   tctx.drawImage(origImage, 0, 0, W, H);
-  const src = tctx.getImageData(0, 0, W, H), dst = tctx.createImageData(W, H);
+  const src = tctx.getImageData(0, 0, W, H);
+  const dst = tctx.createImageData(W, H);
+  const src32 = new Uint32Array(src.data.buffer);
+  const dst32 = new Uint32Array(dst.data.buffer);
   const rawIndices = new Int16Array(W * H).fill(-1);
-  for (let i = 0; i < src.data.length; i += 4) {
-    const pi = i/4, a = src.data[i+3];
-    if (a < 60) { dst.data[i+3] = 0; continue; }
-    const r = src.data[i], g = src.data[i+1], b = src.data[i+2];
+  const len = src32.length;
+
+  for (let i = 0; i < len; i++) {
+    const pixel = src32[i];
+    const a = (pixel >> 24) & 0xFF;
+    if (a < 60) {
+      dst32[i] = 0;
+      continue;
+    }
+    const r = pixel & 0xFF;
+    const g = (pixel >> 8) & 0xFF;
+    const b = (pixel >> 16) & 0xFF;
+
     const best = nearestPaletteIndexRGB(r, g, b);
-    rawIndices[pi] = best;
-    const [nr,ng,nb] = palRGB[best];
-    dst.data[i]=nr; dst.data[i+1]=ng; dst.data[i+2]=nb; dst.data[i+3]=235;
+    rawIndices[i] = best;
+    dst32[i] = palUint32[best] || 0xFF000000;
   }
   tctx.putImageData(dst, 0, 0);
   return { canvas: tmp, rawIndices };
 }
+
 function buildCanvasFromRawIndices(rawIndices, W, H) {
   const tmp = document.createElement('canvas');
   tmp.width = W; tmp.height = H;
   const tctx = tmp.getContext('2d'), img = tctx.createImageData(W, H);
-  for (let i = 0; i < rawIndices.length; i++) {
+  const u32 = new Uint32Array(img.data.buffer);
+  const len = rawIndices.length;
+  for (let i = 0; i < len; i++) {
     const ci = rawIndices[i];
-    if (ci < 0) { img.data[i*4+3]=0; continue; }
-    const [r,g,b] = palRGB[ci];
-    img.data[i*4]=r; img.data[i*4+1]=g; img.data[i*4+2]=b; img.data[i*4+3]=220;
+    if (ci >= 0) u32[i] = palUint32[ci] || 0xFF000000;
   }
   tctx.putImageData(img, 0, 0);
   return tmp;
 }
-function stampTemplate(tpl) {
-  if (!tpl.confirmed || !tpl.rawIndices) return;
+
+function applyStampTemplate(tpl, startX, startY, filterCI) {
+  if (!tpl || !tpl.rawIndices) return;
   const W = Math.round(tpl.w);
   const H = Math.round(tpl.h);
-  const flat = [];
+  const ox = Math.round(startX);
+  const oy = Math.round(startY);
+
+  const buckets = {};
   for (let py = 0; py < H; py++) {
+    const y = oy + py;
+    if (y < 0 || y >= CS) continue;
+    const rowOffset = y * CS;
+    const tplRow = py * W;
     for (let px = 0; px < W; px++) {
-      const ci = tpl.rawIndices[py * W + px];
-      if (ci < 0) continue; // skip transparent pixels
-      if (tpl.filterActive && tpl.filterCI >= 0 && ci !== tpl.filterCI) continue; // apply filter if active
-      const x = Math.round(tpl.x) + px;
-      const y = Math.round(tpl.y) + py;
-      if (x >= 0 && x < CS && y >= 0 && y < CS) {
-        setPixelPalette(x, y, ci);
-        flat.push(x, y, ci);
-      }
+      const x = ox + px;
+      if (x < 0 || x >= CS) continue;
+      const ci = tpl.rawIndices[tplRow + px];
+      if (ci < 0) continue;
+      if (filterCI >= 0 && ci !== filterCI) continue;
+      if (canvasData) canvasData[rowOffset + x] = ci;
+      if (!buckets[ci]) buckets[ci] = [];
+      buckets[ci].push(x, y);
+    }
+  }
+  for (const ci in buckets) {
+    const coords = buckets[ci];
+    offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+    for (let k = 0; k < coords.length; k += 2) {
+      offCtx.fillRect(coords[k], coords[k + 1], 1, 1);
     }
   }
   markDirty();
   scheduleIDBSave();
-  
-  // Broadcast stamped pixels over Supabase Realtime
-  if (ws && ws.readyState === WebSocket.OPEN && flat.length > 0) {
-    for (let i = 0; i < flat.length; i += 6000) {
-      const chunk = flat.slice(i, i + 6000);
-      ws.send(JSON.stringify({
-        topic: 'realtime:bplace',
-        event: 'broadcast',
-        payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
-        ref: String(sbMsgRef++)
-      }));
-    }
+}
+
+function stampTemplate(tpl) {
+  if (!tpl.confirmed || !tpl.rawIndices) return;
+  const fci = (tpl.filterActive && tpl.filterCI >= 0) ? tpl.filterCI : -1;
+  applyStampTemplate(tpl, tpl.x, tpl.y, fci);
+
+  // Broadcast lightweight stamp event (only 60 bytes, works instantly on all devices!)
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      topic: 'realtime:bplace',
+      event: 'broadcast',
+      payload: {
+        type: 'broadcast',
+        event: 'stamp_template',
+        payload: { id: tpl.id, x: Math.round(tpl.x), y: Math.round(tpl.y), filterCI: fci }
+      },
+      ref: String(sbMsgRef++)
+    }));
   }
-  showToast('Plantilla calcada y sincronizada (' + (flat.length / 3) + ' px)', 'success');
+  showToast('Plantilla calcada y sincronizada al instante!', 'success');
 }
 
 function confirmTemplate(tpl) {
@@ -1007,8 +1096,22 @@ function renderGhost(x0,y0,x1,y1){
   else if(tool==='circle'){ghostCtx.beginPath();ghostCtx.ellipse((px0+px1)/2+vz/2,(py0+py1)/2+vz/2,Math.abs(px1-px0)/2+vz/2,Math.abs(py1-py0)/2+vz/2,0,0,Math.PI*2);if(shapeFilled)ghostCtx.fill();else ghostCtx.stroke();}
 }
 
-/* === Zoom/Pan === */
-function doZoom(f,cx,cy){const nz=clamp(vz*f,MIN_Z,MAX_Z);if(nz===vz)return;const wx=cx/vz+vx,wy=cy/vz+vy;vz=nz;vx=wx-cx/vz;vy=wy-cy/vz;$('zoom-display').textContent=Math.round(vz*100)+'%';markDirty();}
+function getZoomDisplay() {
+  if (!zoomDisplayEl) zoomDisplayEl = $('zoom-display');
+  return zoomDisplayEl;
+}
+
+function doZoom(f, cx, cy) {
+  const nz = clamp(vz * f, MIN_Z, MAX_Z);
+  if (nz === vz) return;
+  const wx = cx / vz + vx, wy = cy / vz + vy;
+  vz = nz;
+  vx = wx - cx / vz;
+  vy = wy - cy / vz;
+  const zd = getZoomDisplay();
+  if (zd) zd.textContent = Math.round(vz * 100) + '%';
+  markDirty();
+}
 function fitCanvas(){vz=Math.min(mainCanvas.width/CS,mainCanvas.height/CS);vx=CS/2-mainCanvas.width/2/vz;vy=CS/2-mainCanvas.height/2/vz;$('zoom-display').textContent=Math.round(vz*100)+'%';markDirty();}
 function goTo(cx,cy){vx=cx-mainCanvas.width/2/vz;vy=cy-mainCanvas.height/2/vz;markDirty();}
 
@@ -1159,7 +1262,73 @@ function updateHover(sx, sy) {
 }
 
 /* === Painting === */
-function floodFill(sx,sy,newHex){if(!canvasData)return;const ni=nearestPaletteIndex(newHex);const idx0=sy*CS+sx;const oi=canvasData[idx0];if(oi===ni)return;const q=[idx0],v=new Uint8Array(CS*CS);v[idx0]=1;while(q.length){const ci=q.pop(),cx=ci%CS;canvasData[ci]=ni;offCtx.putImageData(PAL_ID[ni],cx,Math.floor(ci/CS));for(const nn of[ci-1,ci+1,ci-CS,ci+CS]){if(nn<0||nn>=CS*CS||v[nn])continue;if(Math.abs((nn%CS)-cx)>1)continue;if(canvasData[nn]===oi){v[nn]=1;q.push(nn);}}}markDirty();scheduleIDBSave();}
+function executeFloodFill(sx, sy, ni) {
+  if (!canvasData || sx < 0 || sx >= CS || sy < 0 || sy >= CS || ni < 0 || ni >= palRGB.length) return;
+  const idx0 = sy * CS + sx;
+  const oi = canvasData[idx0];
+  if (oi === ni) return;
+
+  const stack = [idx0];
+  const colorStr = palRGBStrings[ni] || paletteHex[ni];
+  offCtx.fillStyle = colorStr;
+
+  while (stack.length > 0) {
+    const idx = stack.pop();
+    if (canvasData[idx] !== oi) continue;
+    const y = Math.floor(idx / CS);
+    const x = idx % CS;
+
+    let lx = x;
+    while (lx > 0 && canvasData[y * CS + (lx - 1)] === oi) lx--;
+    let rx = x;
+    while (rx < CS - 1 && canvasData[y * CS + (rx + 1)] === oi) rx++;
+
+    const fillWidth = rx - lx + 1;
+    const rowOffset = y * CS + lx;
+    canvasData.fill(ni, rowOffset, rowOffset + fillWidth);
+    offCtx.fillRect(lx, y, fillWidth, 1);
+
+    if (y > 0) {
+      let scanAbove = false;
+      const aboveOffset = (y - 1) * CS;
+      for (let i = lx; i <= rx; i++) {
+        if (canvasData[aboveOffset + i] === oi) {
+          if (!scanAbove) { stack.push(aboveOffset + i); scanAbove = true; }
+        } else { scanAbove = false; }
+      }
+    }
+    if (y < CS - 1) {
+      let scanBelow = false;
+      const belowOffset = (y + 1) * CS;
+      for (let i = lx; i <= rx; i++) {
+        if (canvasData[belowOffset + i] === oi) {
+          if (!scanBelow) { stack.push(belowOffset + i); scanBelow = true; }
+        } else { scanBelow = false; }
+      }
+    }
+  }
+
+  markDirty();
+  scheduleIDBSave();
+}
+
+function floodFill(sx, sy, newHex) {
+  const ni = nearestPaletteIndex(newHex);
+  executeFloodFill(sx, sy, ni);
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      topic: 'realtime:bplace',
+      event: 'broadcast',
+      payload: {
+        type: 'broadcast',
+        event: 'fill',
+        payload: { x: sx, y: sy, c: ni }
+      },
+      ref: String(sbMsgRef++)
+    }));
+  }
+}
 function bresenhamLine(x0,y0,x1,y1,fn){const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let err=dx-dy;for(;;){fn(x0,y0);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-dy){err-=dy;x0+=sx;}if(e2<dx){err+=dx;y0+=sy;}}}
 function paintBrush(cx, cy, ci) {
   const r = Math.floor(brushSize / 2);

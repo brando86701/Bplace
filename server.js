@@ -472,6 +472,85 @@ wss.on('connection', ws => {
           canvas[y * CANVAS_SIZE + x] = ci;
           broadcast({ type: 'pixel', x, y, c: ci }, ws);
           scheduleSaveCanvas();
+          forwardToSupabaseRealtime('pixel', { x, y, c: ci });
+        }
+        break;
+      }
+      case 'fill': {
+        const { x, y, c: ci } = msg;
+        executeFloodFillServer(x, y, ci);
+        broadcast({ type: 'fill', x, y, c: ci }, ws);
+        scheduleSaveCanvas();
+        forwardToSupabaseRealtime('fill', { x, y, c: ci });
+        break;
+      }
+      case 'stamp_template': {
+        const tpl = templates.find(t => t.id === msg.id);
+        if (tpl && tpl.rawIndices) {
+          applyStampServer(tpl, msg.x, msg.y, msg.filterCI);
+        }
+        broadcast({ type: 'stamp_template', ...msg }, ws);
+        scheduleSaveCanvas();
+        forwardToSupabaseRealtime('stamp_template', msg);
+        break;
+      }
+      case 'shape': {
+        if (msg.type === 'rect') {
+          const lx = Math.max(0, Math.min(msg.x0, msg.x1));
+          const rx = Math.min(CANVAS_SIZE - 1, Math.max(msg.x0, msg.x1));
+          const ty = Math.max(0, Math.min(msg.y0, msg.y1));
+          const by = Math.min(CANVAS_SIZE - 1, Math.max(msg.y0, msg.y1));
+          const w = rx - lx + 1;
+          if (msg.fill) {
+            for (let y = ty; y <= by; y++) {
+              canvas.fill(msg.c, y * CANVAS_SIZE + lx, y * CANVAS_SIZE + lx + w);
+            }
+          } else {
+            for (let x = lx; x <= rx; x++) {
+              canvas[ty * CANVAS_SIZE + x] = msg.c;
+              canvas[by * CANVAS_SIZE + x] = msg.c;
+            }
+            for (let y = ty + 1; y < by; y++) {
+              canvas[y * CANVAS_SIZE + lx] = msg.c;
+              canvas[y * CANVAS_SIZE + rx] = msg.c;
+            }
+          }
+        } else if (msg.type === 'circle') {
+          const cx = msg.cx, cy = msg.cy, a = Math.max(0, msg.a), b = Math.max(0, msg.b), ci = msg.c;
+          if (msg.fill) {
+            for (let dy = -b; dy <= b; dy++) {
+              const py = cy + dy;
+              if (py < 0 || py >= CANVAS_SIZE) continue;
+              const xs = Math.round(a * Math.sqrt(Math.max(0, 1 - (dy * dy) / (b * b + 0.0001))));
+              const lx = Math.max(0, cx - xs);
+              const rx = Math.min(CANVAS_SIZE - 1, cx + xs);
+              const w = rx - lx + 1;
+              if (w > 0) canvas.fill(ci, py * CANVAS_SIZE + lx, py * CANVAS_SIZE + lx + w);
+            }
+          }
+        } else if (msg.type === 'line') {
+          const sz = msg.size || 1;
+          bresenhamLineServer(msg.x0, msg.y0, msg.x1, msg.y1, (x, y) => {
+            paintBrushServer(x, y, msg.c, sz);
+          });
+        }
+        broadcast({ type: 'shape', ...msg }, ws);
+        scheduleSaveCanvas();
+        forwardToSupabaseRealtime('shape', msg);
+        break;
+      }
+      case 'lines_batch': {
+        const p = msg.lines || msg.payload;
+        if (Array.isArray(p)) {
+          for (let i = 0; i < p.length; i += 6) {
+            const x0 = p[i], y0 = p[i + 1], x1 = p[i + 2], y1 = p[i + 3], ci = p[i + 4], sz = p[i + 5] || 1;
+            bresenhamLineServer(x0, y0, x1, y1, (x, y) => {
+              paintBrushServer(x, y, ci, sz);
+            });
+          }
+          broadcast({ type: 'lines_batch', lines: p }, ws);
+          scheduleSaveCanvas();
+          forwardToSupabaseRealtime('lines_batch', p);
         }
         break;
       }
@@ -490,6 +569,7 @@ wss.on('connection', ws => {
         canvas.fill(0);
         scheduleSaveCanvas();
         broadcast({ type: 'clear' }, ws);
+        forwardToSupabaseRealtime('clear', {});
         break;
       }
     }
@@ -503,6 +583,20 @@ wss.on('connection', ws => {
 //  SUPABASE REALTIME CLOUD BRIDGE
 // ───────────────────────────────────────────────
 let wsCloudBridge = null;
+let srvRef = 1000;
+
+function forwardToSupabaseRealtime(event, payload) {
+  if (wsCloudBridge && wsCloudBridge.readyState === WebSocket.OPEN) {
+    try {
+      wsCloudBridge.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: { type: 'broadcast', event, payload },
+        ref: 'srv_fwd_' + (srvRef++)
+      }));
+    } catch {}
+  }
+}
 
 function bresenhamLineServer(x0, y0, x1, y1, fn) {
   const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
@@ -536,6 +630,72 @@ function paintBrushServer(cx, cy, ci, brushSize) {
   for (let py = minY; py <= maxY; py++) {
     const rowOffset = py * CANVAS_SIZE + minX;
     canvas.fill(ci, rowOffset, rowOffset + w);
+  }
+}
+
+function executeFloodFillServer(sx, sy, ni) {
+  if (sx < 0 || sx >= CANVAS_SIZE || sy < 0 || sy >= CANVAS_SIZE || ni < 0 || ni >= PALETTE.length) return;
+  const idx0 = sy * CANVAS_SIZE + sx;
+  const oi = canvas[idx0];
+  if (oi === ni) return;
+
+  const stack = [idx0];
+  while (stack.length > 0) {
+    const idx = stack.pop();
+    if (canvas[idx] !== oi) continue;
+    const y = Math.floor(idx / CANVAS_SIZE);
+    const x = idx % CANVAS_SIZE;
+
+    let lx = x;
+    while (lx > 0 && canvas[y * CANVAS_SIZE + (lx - 1)] === oi) lx--;
+    let rx = x;
+    while (rx < CANVAS_SIZE - 1 && canvas[y * CANVAS_SIZE + (rx + 1)] === oi) rx++;
+
+    const fillWidth = rx - lx + 1;
+    const rowOffset = y * CANVAS_SIZE + lx;
+    canvas.fill(ni, rowOffset, rowOffset + fillWidth);
+
+    if (y > 0) {
+      let scanAbove = false;
+      const aboveOffset = (y - 1) * CANVAS_SIZE;
+      for (let i = lx; i <= rx; i++) {
+        if (canvas[aboveOffset + i] === oi) {
+          if (!scanAbove) { stack.push(aboveOffset + i); scanAbove = true; }
+        } else { scanAbove = false; }
+      }
+    }
+    if (y < CANVAS_SIZE - 1) {
+      let scanBelow = false;
+      const belowOffset = (y + 1) * CANVAS_SIZE;
+      for (let i = lx; i <= rx; i++) {
+        if (canvas[belowOffset + i] === oi) {
+          if (!scanBelow) { stack.push(belowOffset + i); scanBelow = true; }
+        } else { scanBelow = false; }
+      }
+    }
+  }
+}
+
+function applyStampServer(tpl, startX, startY, filterCI) {
+  if (!tpl || !tpl.rawIndices) return;
+  const W = Math.round(tpl.w);
+  const H = Math.round(tpl.h);
+  const ox = Math.round(startX);
+  const oy = Math.round(startY);
+
+  for (let py = 0; py < H; py++) {
+    const y = oy + py;
+    if (y < 0 || y >= CANVAS_SIZE) continue;
+    const rowOffset = y * CANVAS_SIZE;
+    const tplRow = py * W;
+    for (let px = 0; px < W; px++) {
+      const x = ox + px;
+      if (x < 0 || x >= CANVAS_SIZE) continue;
+      const ci = tpl.rawIndices[tplRow + px];
+      if (ci < 0 || ci >= PALETTE.length) continue;
+      if (filterCI >= 0 && ci !== filterCI) continue;
+      canvas[rowOffset + x] = ci;
+    }
   }
 }
 
@@ -615,6 +775,18 @@ function connectServerToSupabaseRealtime() {
                 paintBrushServer(x, y, p.c, sz);
               });
             }
+            broadcast({ type: 'shape', ...p });
+            scheduleSaveCanvas();
+          } else if (ev === 'fill' && p) {
+            executeFloodFillServer(p.x, p.y, p.c);
+            broadcast({ type: 'fill', x: p.x, y: p.y, c: p.c });
+            scheduleSaveCanvas();
+          } else if (ev === 'stamp_template' && p) {
+            const tpl = templates.find(t => t.id === p.id);
+            if (tpl && tpl.rawIndices) {
+              applyStampServer(tpl, p.x, p.y, p.filterCI);
+            }
+            broadcast({ type: 'stamp_template', ...p });
             scheduleSaveCanvas();
           } else if (ev === 'lines_batch' && Array.isArray(p)) {
             const len = p.length;
@@ -624,6 +796,7 @@ function connectServerToSupabaseRealtime() {
                 paintBrushServer(x, y, ci, sz);
               });
             }
+            broadcast({ type: 'lines_batch', lines: p });
             scheduleSaveCanvas();
           } else if (ev === 'flat_batch' && Array.isArray(p)) {
             const len = p.length;
@@ -633,6 +806,7 @@ function connectServerToSupabaseRealtime() {
                 canvas[y * CANVAS_SIZE + x] = ci;
               }
             }
+            broadcast({ type: 'flat_batch', pixels: p });
             scheduleSaveCanvas();
           } else if (ev === 'batch' && p && Array.isArray(p.pixels)) {
             p.pixels.forEach(px => {
