@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>BPlace — Lienzo Colaborativo de Pixel Art</title>
+  <meta name="description" content="BPlace — Tu estudio personal y colaborativo de pixel art. Pinta, crea y experimenta en tiempo real.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=60000">
+</head>
+<body class="dark-theme">
+
+<div id="app">
+
+  <!-- CANVAS AREA (FULL VIEWPORT) -->
+  <main id="canvas-wrap">
+    <canvas id="main-canvas"></canvas>
+    <canvas id="ghost-canvas"></canvas>
+    <div id="px-cursor" class="px-cursor hidden"></div>
+  </main>
+
+  <!-- FLOATING TOP BAR OVERLAY -->
+  <header id="topbar">
+    <div class="tb-floating-left">
+      <div class="tb-logo"><span class="logo-b">B</span>Place</div>
+      <div class="tb-sep"></div>
+      <div class="tb-info-chips">
+        <span class="chip chip-coords" id="coord-display" title="Coordenadas del cursor">— , —</span>
+        <span class="chip chip-zoom" id="zoom-display" title="Zoom">100%</span>
+        <span class="chip chip-size" id="canvas-size-display" title="Tamaño del canvas">3000 × 3000</span>
+      </div>
+    </div>
+
+    <div class="tb-floating-right">
+      <button class="tb-btn" id="btn-theme" title="Cambiar tema" onclick="toggleTheme()">
+        <svg id="theme-icon" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        <span class="tb-label" id="theme-text">Claro</span>
+      </button>
+      <button class="tb-btn" id="btn-fit" title="Ajustar (F)">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+        <span class="tb-label">Ajustar</span>
+      </button>
+      <button class="tb-btn" id="btn-export" title="Exportar canvas">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        <span class="tb-label">Exportar</span>
+      </button>
+      <button class="tb-btn" id="btn-clear" title="Limpiar canvas">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+        <span class="tb-label">Limpiar</span>
+      </button>
+      <button class="tb-btn" id="btn-goto" title="Ir a coordenadas">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <span class="tb-label">Ir a…</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- COLLAPSED IDLE FAB BUTTON (Visible when NOT in paint mode) -->
+  <button id="btn-pintar" class="wplace-idle-fab" title="Abrir paleta para pintar">
+    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+    <span>Pintar</span>
+  </button>
+
+  <!-- FLOATING PAINT DOCK (Visible ONLY when active in paint mode) -->
+  <div id="wplace-dock">
+
+    <!-- DOCK CARD CONTAINER -->
+    <div class="dock-card" id="dock-card">
+
+      <!-- CLOSE BUTTON (X) TO EXIT PAINT MODE -->
+      <button class="dock-close-x" id="dock-close-btn" title="Cerrar paleta (Esc)">✕</button>
+      <button id="bb-close" class="hidden-compat"></button>
+
+      <!-- TOOLBAR ROW -->
+      <div class="dock-row dock-tools-row">
+
+        <!-- Tools grid / pills -->
+        <div class="tools-pill-group" id="tools-sidebar">
+          <button class="tool-btn active" id="tool-brush" data-tool="brush" title="Pincel (B)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08"/><path d="M7.07 14.94c-1.66 0-3 1.34-3 3 0 1.99-1.5 3-1.5 3s2.44.07 4.14-1.63c.96-.96 1.36-2.4 1.36-4.37Z"/></svg>
+            <span>Pincel</span>
+          </button>
+          <button class="tool-btn" id="tool-erase" data-tool="erase" title="Borrador (E)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>
+            <span>Borrador</span>
+          </button>
+          <button class="tool-btn" id="tool-eye" data-tool="eye" title="Gotero (I)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8-1 1"/></svg>
+            <span>Gotero</span>
+          </button>
+          <button class="tool-btn" id="tool-line" data-tool="line" title="Línea (L)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="5" y1="19" x2="19" y2="5"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="5" r="2"/></svg>
+            <span>Línea</span>
+          </button>
+          <button class="tool-btn" id="tool-rect" data-tool="rect" title="Rectángulo (R)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+            <span>Rect</span>
+          </button>
+          <button class="tool-btn" id="tool-circle" data-tool="circle" title="Círculo (C)">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/></svg>
+            <span>Círculo</span>
+          </button>
+          <button class="tool-btn" id="btn-tpl-open" title="Plantillas">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+            <span>Plantillas</span>
+          </button>
+          <button class="tool-btn" id="btn-lock" title="Bloquear movimiento">
+            <svg id="lock-icon" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path d="M7 11V7a5 5 0 0 1 9.9-1"/><rect x="3" y="11" width="18" height="11" rx="2"/>
+            </svg>
+            <span>Bloquear</span>
+          </button>
+        </div>
+
+        <!-- Tool context options (Shape options) -->
+        <div class="shape-opts" id="shape-opts-area">
+          <button class="shape-opt active" id="opt-filled" title="Relleno">▪ Relleno</button>
+          <button class="shape-opt" id="opt-hollow" title="Hueco">□ Hueco</button>
+        </div>
+
+      </div><!-- .dock-tools-row -->
+
+      <!-- PALETTE ROW -->
+      <div class="dock-row dock-palette-row">
+
+        <!-- Color indicator & swap -->
+        <div class="cur-color-section">
+          <div class="cur-colors-stack">
+            <div class="cur-bg-color" id="cur-bg-color" title="Color de fondo (clic para intercambiar)"></div>
+            <div class="cur-fg-color" id="cur-fg-color" title="Color principal"></div>
+            <button class="swap-btn" id="btn-swap-colors" title="Intercambiar colores">
+              <svg width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M7 16V4m0 0L3 8m4-4 4 4"/><path d="M17 8v12m0 0 4-4m-4 4-4-4"/></svg>
+            </button>
+          </div>
+          <span id="cur-hex" class="cur-hex-label">#FFFFFF</span>
+        </div>
+
+        <!-- Custom picker -->
+        <div class="custom-picker-section">
+          <input type="color" id="custom-color" value="#ff4500" class="color-picker-input" title="Selector de color personalizado">
+          <button class="picker-add-btn" id="btn-add-color" title="Añadir a favoritos">
+            <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+        </div>
+
+        <div class="dock-vsep"></div>
+
+        <!-- Palette Scroll Container with Nav Arrows & Expand Tab -->
+        <div class="palette-container" id="palette-container">
+          <button class="pal-nav-btn" id="pal-scroll-left" title="Desplazar izquierda">‹</button>
+          
+          <div class="palette-scroll-wrap" id="palette-scroll-wrap">
+            <div id="palette-grid" class="palette-grid-wplace"></div>
+          </div>
+
+          <button class="pal-nav-btn" id="pal-scroll-right" title="Desplazar derecha">›</button>
+
+          <!-- EXPAND TAB / DRAWER TOGGLE -->
+          <button class="pal-expand-btn" id="btn-expand-palette" title="Ver todos los 64 colores">
+            <span class="expand-icon-wrap">
+              <svg id="expand-arrow" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></svg>
+            </span>
+            <span class="expand-label">Todos</span>
+          </button>
+        </div>
+
+      </div><!-- .dock-palette-row -->
+
+      <!-- ACTION BUTTON ROW (wplace main paint FAB inside dock) -->
+      <div class="dock-row dock-action-row">
+        <button id="btn-pintar-action" class="wplace-paint-fab-inside">
+          <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+          <span>Pintar</span>
+        </button>
+      </div>
+
+    </div><!-- .dock-card -->
+
+  </div><!-- #wplace-dock -->
+
+  <!-- HIDDEN COMPATIBILITY CONTAINERS FOR APP.JS -->
+  <div id="layout" class="hidden-layout-compat">
+    <aside id="sidebar-palette" class="hidden-compat">
+      <div id="recent-colors" class="hidden-grid"></div>
+      <div id="fav-colors" class="hidden-grid"></div>
+      <div id="mobile-actions-section" class="hidden-compat">
+        <button id="btn-theme-mobile"></button>
+        <button id="btn-goto-mobile"></button>
+        <button id="btn-clear-mobile"></button>
+      </div>
+    </aside>
+    <div id="tools-sidebar-dup" class="hidden-compat"></div>
+  </div>
+  <div id="bottom-bar" class="hidden-compat">
+    <span id="bb-tool-name">Pincel</span>
+  </div>
+
+  <!-- TEMPLATE PANEL (Floating Glass Modal) -->
+  <aside id="tpl-panel" class="floating-panel hidden">
+    <div class="fp-header">
+      <span class="fp-title">🖼️ Plantillas de Referencia</span>
+      <button class="fp-close" id="btn-tpl-x" title="Cerrar">✕</button>
+    </div>
+    <div class="fp-body">
+      <button id="btn-tpl-upload" class="upload-btn">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Cargar imagen de guía…
+      </button>
+      <input type="file" id="tpl-file" accept="image/*" class="hidden" multiple>
+      <div id="tpl-list" class="tpl-list"></div>
+    </div>
+  </aside>
+
+  <!-- DIALOG: EXPORTAR -->
+  <div id="export-dialog" class="dialog-bg hidden">
+    <div class="dialog-box">
+      <div class="dialog-hd">
+        <h3>Exportar PNG</h3>
+        <button class="dialog-x" id="btn-export-x">✕</button>
+      </div>
+      <div class="dialog-body">
+        <div class="export-scale-row">
+          <label>Escala de exportación</label>
+          <div class="scale-btns">
+            <button class="scale-btn active" data-scale="1">1×</button>
+            <button class="scale-btn" data-scale="2">2×</button>
+            <button class="scale-btn" data-scale="4">4×</button>
+            <button class="scale-btn" data-scale="8">8×</button>
+          </div>
+        </div>
+        <p class="export-info" id="export-info">Tamaño: 3000 × 3000 px</p>
+      </div>
+      <div class="dialog-btns">
+        <button class="btn-sec-sm" id="btn-export-cancel">Cancelar</button>
+        <button class="btn-prim-sm" id="btn-export-ok">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Descargar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DIALOG: IR A COORDENADAS -->
+  <div id="goto-dialog" class="dialog-bg hidden">
+    <div class="dialog-box">
+      <div class="dialog-hd">
+        <h3>Ir a Coordenadas</h3>
+        <button class="dialog-x" id="btn-goto-x">✕</button>
+      </div>
+      <div class="dialog-body">
+        <div class="pos-row">
+          <label>X <input type="number" id="goto-x" value="1500" min="0" max="2999"></label>
+          <label>Y <input type="number" id="goto-y" value="1500" min="0" max="2999"></label>
+        </div>
+      </div>
+      <div class="dialog-btns">
+        <button class="btn-sec-sm" id="btn-goto-cancel">Cancelar</button>
+        <button class="btn-prim-sm" id="btn-goto-ok">Ir al punto →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOADING OVERLAY -->
+  <div id="loading">
+    <div class="ld-box">
+      <div class="ld-logo"><span>B</span>Place</div>
+      <div class="ld-bar-wrap"><div id="ld-bar" class="ld-bar"></div></div>
+      <p id="ld-txt" class="ld-txt">Cargando lienzo en tiempo real…</p>
+    </div>
+  </div>
+
+  <!-- TOAST NOTIFICATION -->
+  <div id="toast" class="toast hidden"></div>
+  <div id="mobile-overlay" class="mobile-overlay"></div>
+
+</div><!-- #app -->
+
+<script src="app.js?v=60002"></script>
+</body>
+</html>
