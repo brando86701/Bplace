@@ -605,6 +605,188 @@ const ctx         = mainCanvas.getContext('2d');
 const ghostCtx    = ghostCanvas.getContext('2d');
 const wrap        = $('canvas-wrap');
 
+/* === Pixel Sound SFX (Max 5/sec) === */
+let audioCtx = null;
+let pixelAudioBuffer = null;
+let lastPixelSoundTime = 0;
+const PIXEL_SOUND_INTERVAL = 200; // Max 5 times per second (1000ms / 5 = 200ms)
+
+const audioPool = [
+  new Audio('pixel.mp3'),
+  new Audio('pixel.mp3'),
+  new Audio('pixel.mp3'),
+  new Audio('pixel.mp3'),
+  new Audio('pixel.mp3')
+];
+let audioPoolIdx = 0;
+
+/* === Selection Sound SFX (Max 4/sec) === */
+let selectAudioBuffer = null;
+let lastSelectSoundTime = -10000;
+let isStartupComplete = false;
+const SELECT_SOUND_INTERVAL = 250; // Max 4 times per second (1000ms / 4 = 250ms)
+
+const selectAudioPool = [
+  new Audio('select.mp3'),
+  new Audio('select.mp3'),
+  new Audio('select.mp3')
+];
+let selectAudioPoolIdx = 0;
+
+/* === Close / 'X' Sound SFX === */
+let closeAudioBuffer = null;
+let lastCloseSoundTime = -10000;
+const CLOSE_SOUND_INTERVAL = 150;
+
+const closeAudioPool = [
+  new Audio('close.mp3'),
+  new Audio('close.mp3'),
+  new Audio('close.mp3')
+];
+let closeAudioPoolIdx = 0;
+
+function initAudioEngine() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass && !audioCtx) {
+      audioCtx = new AudioContextClass();
+    }
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+    if (audioCtx) {
+      if (!pixelAudioBuffer) {
+        fetch('pixel.mp3')
+          .then(res => res.arrayBuffer())
+          .then(buf => audioCtx.decodeAudioData(buf))
+          .then(decoded => { pixelAudioBuffer = decoded; })
+          .catch(() => {});
+      }
+      if (!selectAudioBuffer) {
+        fetch('select.mp3')
+          .then(res => res.arrayBuffer())
+          .then(buf => audioCtx.decodeAudioData(buf))
+          .then(decoded => { selectAudioBuffer = decoded; })
+          .catch(() => {});
+      }
+      if (!closeAudioBuffer) {
+        fetch('close.mp3')
+          .then(res => res.arrayBuffer())
+          .then(buf => audioCtx.decodeAudioData(buf))
+          .then(decoded => { closeAudioBuffer = decoded; })
+          .catch(() => {});
+      }
+    }
+  } catch (e) {}
+}
+
+function playPixelSound() {
+  const now = performance.now();
+  if (now - lastPixelSoundTime < PIXEL_SOUND_INTERVAL) return;
+  lastPixelSoundTime = now;
+
+  try {
+    if (!audioCtx) initAudioEngine();
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+
+    if (audioCtx && pixelAudioBuffer) {
+      const source = audioCtx.createBufferSource();
+      source.buffer = pixelAudioBuffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+      return;
+    }
+
+    const a = audioPool[audioPoolIdx];
+    audioPoolIdx = (audioPoolIdx + 1) % audioPool.length;
+    if (a) {
+      a.currentTime = 0;
+      a.play().catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function playSelectSound() {
+  if (!isStartupComplete) return;
+  const now = performance.now();
+  if (now - lastSelectSoundTime < SELECT_SOUND_INTERVAL) return;
+  lastSelectSoundTime = now;
+
+  try {
+    if (!audioCtx) initAudioEngine();
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+
+    if (audioCtx && selectAudioBuffer) {
+      const source = audioCtx.createBufferSource();
+      source.buffer = selectAudioBuffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+      return;
+    }
+
+    const a = selectAudioPool[selectAudioPoolIdx];
+    selectAudioPoolIdx = (selectAudioPoolIdx + 1) % selectAudioPool.length;
+    if (a) {
+      a.currentTime = 0;
+      a.play().catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function playCloseSound() {
+  if (!isStartupComplete) return;
+  const now = performance.now();
+  if (now - lastCloseSoundTime < CLOSE_SOUND_INTERVAL) return;
+  lastCloseSoundTime = now;
+
+  try {
+    if (!audioCtx) initAudioEngine();
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+
+    if (audioCtx && closeAudioBuffer) {
+      const source = audioCtx.createBufferSource();
+      source.buffer = closeAudioBuffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+      return;
+    }
+
+    const a = closeAudioPool[closeAudioPoolIdx];
+    closeAudioPoolIdx = (closeAudioPoolIdx + 1) % closeAudioPool.length;
+    if (a) {
+      a.currentTime = 0;
+      a.play().catch(() => {});
+    }
+  } catch (e) {}
+}
+
+['pointerdown', 'touchstart', 'keydown'].forEach(evt => {
+  window.addEventListener(evt, () => initAudioEngine(), { once: true, passive: true });
+});
+
+// Global listener: play close sound for X buttons, select sound for other clickable controls
+document.addEventListener('click', e => {
+  const target = e.target;
+  if (!target) return;
+
+  const closeBtn = target.closest('.dock-close-x, #dock-close-btn, #bb-close, .fp-close, #btn-tpl-x, .dialog-x, #btn-export-x, #btn-goto-x, [data-act="close"]');
+  if (closeBtn) {
+    playCloseSound();
+    return;
+  }
+
+  const clickable = target.closest('button, .tool-btn, .swatch, .scale-btn, .opt-btn, .tpl-icon-btn, .color-swatch, .fab, input[type="color"], [data-tool], [data-act]');
+  if (clickable) {
+    playSelectSound();
+  }
+}, true);
+
 /* === Utilities === */
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function inCanvas(x, y)   { return x >= 0 && x < CS && y >= 0 && y < CS; }
@@ -950,6 +1132,7 @@ function stampTemplate(tpl) {
   const oy = Math.round(tpl.y);
 
   applyStampTemplate(tpl, tpl.x, tpl.y, fci);
+  playPixelSound();
 
   // Collect flat pixels for guaranteed synchronization across all clients & server
   const flat = [];
@@ -1154,6 +1337,7 @@ function goTo(cx,cy){vx=cx-mainCanvas.width/2/vz;vy=cy-mainCanvas.height/2/vz;ma
 /* === Tools === */
 function setTool(t){
   tool=t;
+  playSelectSound();
   document.querySelectorAll('.tool-btn').forEach(b=>b.classList.remove('active'));
   const btn=$('tool-'+t);if(btn)btn.classList.add('active');
   wrap.className='cursor-'+t;
@@ -1167,13 +1351,14 @@ function setTool(t){
   const names={brush:'Pincel (B)',erase:'Borrador (E)',eye:'Gotas (I)',line:'Linea (L)',rect:'Rectangulo (R)',circle:'Circulo (C)'};
   const bb=$('bb-tool-name');if(bb)bb.textContent=names[t]||t;
 }
-function setShapeFilled(f){shapeFilled=f;$('opt-filled').classList.toggle('active',f);$('opt-hollow').classList.toggle('active',!f);}
+function setShapeFilled(f){shapeFilled=f;$('opt-filled').classList.toggle('active',f);$('opt-hollow').classList.toggle('active',!f);playSelectSound();}
 
 /* === Color === */
 let currentPaletteCI = 5; // Default to black (#000000)
 
 function setCurrentColor(hex,addToRecent){
   if(addToRecent===undefined)addToRecent=true;
+  playSelectSound();
   currentColorHex=hex;
   currentPaletteCI = nearestPaletteIndex(hex);
   $('cur-fg-color').style.backgroundColor=hex;
@@ -1354,6 +1539,7 @@ function executeFloodFill(sx, sy, ni) {
 function floodFill(sx, sy, newHex) {
   const ni = nearestPaletteIndex(newHex);
   executeFloodFill(sx, sy, ni);
+  playPixelSound();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
@@ -1474,6 +1660,7 @@ function paintPixelMain(x, y) {
   const ci = currentPaletteCI;
   paintBrush(x, y, ci);
   markDirty();
+  playPixelSound();
   if (brushSize === 1) {
     queueWSPixel(x, y, ci);
   } else {
@@ -1487,6 +1674,7 @@ function paintLineMain(x0, y0, x1, y1) {
     paintBrush(x, y, ci);
   });
   markDirty();
+  playPixelSound();
   queueWSLine(x0, y0, x1, y1, ci, brushSize);
 }
 
@@ -1505,6 +1693,7 @@ function commitShape(x0, y0, x1, y1) {
   } else if (tool === 'line') {
     paintLineMain(x0, y0, x1, y1);
   }
+  playPixelSound();
   markDirty();
   scheduleIDBSave();
   flushWSPixels();
@@ -1528,6 +1717,7 @@ function onMouseDown(e){
     paintBrush(x,y,ci);
     queueWSLine(x,y,x,y,0,brushSize);
     markDirty();
+    playPixelSound();
   }
   else paintPixelMain(x,y);
 }
@@ -1544,6 +1734,7 @@ function onMouseMove(e){
       } else {
         paintBrush(x,y,ci);
         queueWSLine(x,y,x,y,ci,brushSize);
+        playPixelSound();
       }
       markDirty();
       spLX=x;spLY=y;
@@ -1560,6 +1751,7 @@ function onMouseMove(e){
         bresenhamLine(drawLX,drawLY,x,y,(px,py)=>{paintBrush(px,py,ci);});
         queueWSLine(drawLX,drawLY,x,y,0,brushSize);
         markDirty();
+        playPixelSound();
       }
       drawLX=x;drawLY=y;
     }
@@ -1577,11 +1769,13 @@ function onKeyUp(e){if(e.key===' '){spaceHeld=false;spLX=-1;spLY=-1;}}
 
 /* === Paint Mode === */
 function activatePaintMode(toolName) {
+  playSelectSound();
   paintModeActive = true;
   document.body.classList.add('paint-mode');
   setTool(toolName || tool || 'brush');
 }
 function deactivatePaintMode() {
+  playCloseSound();
   paintModeActive = false;
   document.body.classList.remove('paint-mode');
   
@@ -1638,6 +1832,7 @@ function toggleMobileSidebar(force) {
 function resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(mainCanvas.width!==w||mainCanvas.height!==h){mainCanvas.width=w;mainCanvas.height=h;ghostCanvas.width=w;ghostCanvas.height=h;markDirty();}}
 function setBrushSize(s) {
   brushSize = clamp(s, 1, 32);
+  playSelectSound();
   const bs = $('brush-size');
   if (bs) bs.value = brushSize;
   const bsv = $('brush-size-val');
@@ -1922,6 +2117,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   /* X button: fully close panel */
   $('btn-tpl-x').addEventListener('click', () => {
+    playCloseSound();
     tplPanel.classList.add('hidden');
     tplPanel.classList.remove('collapsed');
     updatePanelTabIcon();
@@ -2013,6 +2209,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   const handlePintarBtn = (e) => {
     e.preventDefault();
     e.stopPropagation();
+    playSelectSound();
     activatePaintMode('brush');
   };
   const pintarFab = $('btn-pintar');
@@ -2024,6 +2221,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   const handleClosePalette = (e) => {
     e.preventDefault();
     e.stopPropagation();
+    playCloseSound();
     deactivatePaintMode();
   };
   const closeBtn = $('bb-close');
@@ -2040,6 +2238,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (btnPintarAction) {
     btnPintarAction.addEventListener('click', (e) => {
       e.preventDefault();
+      playSelectSound();
       setTool('brush');
       showToast('Pincel activo: Haz clic o arrastra para pintar', 'success');
     });
@@ -2077,13 +2276,13 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('tpl-file').addEventListener('change',e=>{Array.from(e.target.files).forEach(loadTemplateFile);e.target.value='';});
   document.querySelectorAll('.scale-btn').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('.scale-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');exportScale=parseInt(b.dataset.scale);$('export-info').textContent='Tamano: '+(CS*exportScale)+'x'+(CS*exportScale)+' px';});});
   $('btn-export-ok').addEventListener('click',()=>{$('export-dialog').classList.add('hidden');doExport();});
-  $('btn-export-cancel').addEventListener('click',()=>$('export-dialog').classList.add('hidden'));
-  $('btn-export-x').addEventListener('click',()=>$('export-dialog').classList.add('hidden'));
-  $('export-dialog').addEventListener('click',e=>{if(e.target===$('export-dialog'))$('export-dialog').classList.add('hidden');});
+  $('btn-export-cancel').addEventListener('click',()=>{$('export-dialog').classList.add('hidden');playCloseSound();});
+  $('btn-export-x').addEventListener('click',()=>{$('export-dialog').classList.add('hidden');playCloseSound();});
+  $('export-dialog').addEventListener('click',e=>{if(e.target===$('export-dialog')){$('export-dialog').classList.add('hidden');playCloseSound();}});
   $('btn-goto-ok').addEventListener('click',()=>{const x=clamp(parseInt($('goto-x').value)||0,0,CS-1),y=clamp(parseInt($('goto-y').value)||0,0,CS-1);goTo(x,y);$('goto-dialog').classList.add('hidden');});
-  $('btn-goto-cancel').addEventListener('click',()=>$('goto-dialog').classList.add('hidden'));
-  $('btn-goto-x').addEventListener('click',()=>$('goto-dialog').classList.add('hidden'));
-  $('goto-dialog').addEventListener('click',e=>{if(e.target===$('goto-dialog'))$('goto-dialog').classList.add('hidden');});
+  $('btn-goto-cancel').addEventListener('click',()=>{$('goto-dialog').classList.add('hidden');playCloseSound();});
+  $('btn-goto-x').addEventListener('click',()=>{$('goto-dialog').classList.add('hidden');playCloseSound();});
+  $('goto-dialog').addEventListener('click',e=>{if(e.target===$('goto-dialog')){$('goto-dialog').classList.add('hidden');playCloseSound();}});
 
   /* === Load canvas data (Ultra-Fast Startup) === */
   try {
@@ -2134,6 +2333,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   fitCanvas();
   wsConnect();
+  setTimeout(() => { isStartupComplete = true; }, 100);
 
   // Load shared templates from Supabase Cloud
   loadTemplatesFromCloud().then(ok => {
@@ -2430,12 +2630,11 @@ window.addEventListener('DOMContentLoaded', async () => {
         const {x, y} = s2c(touchState.sx, touchState.sy);
         if (inCanvas(x, y)) {
           if (tool === 'brush') {
-            paintBrush(x, y, currentPaletteCI);
-            markDirty();
-            queueWSPixel(x, y, currentPaletteCI);
+            paintPixelMain(x, y);
           } else if (tool === 'erase') {
             paintBrush(x, y, 0);
             markDirty();
+            playPixelSound();
             queueWSPixel(x, y, 0);
           } else if (tool === 'eye') {
             const hex = sampleScreenAt(touchState.sx, touchState.sy);
