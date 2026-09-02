@@ -35,104 +35,214 @@ const BASE_PALETTE = [
   '#2E3A4E','#4E5D78','#8496B8','#3D3731','#6B6358','#A39989','#D4CDBF'
 ];
 
-/* === WebSocket Multiplayer === */
+/* === WebSocket Multiplayer (Hybrid: Local Server + Supabase Realtime Edge) === */
+const SUPABASE_CONFIG = {
+  url: 'https://jtwbuempcdjrbqfgvaar.supabase.co',
+  anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp0d2J1ZW1wY2RqcmJxZmd2YWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgzMTE4OTksImV4cCI6MjEwMzg4Nzg5OX0.562ZWgCbV2eOcDptn_LrT-ONv6DF4yFgZGY6ttiZsjg',
+  cdnCanvas: 'https://jtwbuempcdjrbqfgvaar.supabase.co/storage/v1/object/public/bplace/canvas.bin'
+};
+
 let ws = null;
 let wsReady = false;
-
-function wsConnect() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = proto + '//' + location.host;
-  ws = new WebSocket(url);
-
-  ws.addEventListener('open', () => {
-    console.log('[WS] conectado');
-    wsReady = true;
-  });
-
-  ws.addEventListener('message', async e => {
-    let msg; try { msg = JSON.parse(e.data); } catch { return; }
-    switch (msg.type) {
-      case 'auth_ok':
-        wsReady = true;
-        updateOnlineChip(null);
-        break;
-      case 'pixel':
-        applyRemotePixel(msg.x, msg.y, msg.c);
-        break;
-      case 'batch':
-        (msg.pixels || []).forEach(p => applyRemotePixel(p.x, p.y, p.c));
-        break;
-      case 'clear':
-        if (canvasData) { canvasData.fill(0); offCtx.fillStyle='#FFFFFF'; offCtx.fillRect(0,0,CS,CS); markDirty(); }
-        break;
-      case 'online':
-        updateOnlineChip(msg.count);
-        break;
-      case 'templates_list': {
-        const incoming = msg.templates || [];
-        const loadedList = [];
-        for (let i = 0; i < incoming.length; i++) {
-          await addTemplateFromData(incoming[i], loadedList);
-          // Yield to event loop between templates to maintain 60fps responsiveness
-          if (i % 2 === 0) await new Promise(r => setTimeout(r, 0));
-        }
-        templates = loadedList;
-        renderTemplateList();
-        markDirty();
-        break;
-      }
-      case 'template_add':
-        if (!templates.some(t => t.id === msg.template.id)) {
-          await addTemplateFromData(msg.template);
-          renderTemplateList();
-          markDirty();
-        }
-        break;
-      case 'template_update': {
-        const tpl = templates.find(t => t.id === msg.id);
-        if (tpl) {
-          tpl.x = msg.updates.x;
-          tpl.y = msg.updates.y;
-          const sizeChanged = tpl.w !== msg.updates.w || tpl.h !== msg.updates.h;
-          tpl.w = msg.updates.w;
-          tpl.h = msg.updates.h;
-          if (msg.updates.confirmed && !tpl.confirmed) {
-            tpl.confirmed = true;
-            const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
-            tpl.canvas = canvas;
-            tpl.rawIndices = rawIndices;
-            tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
-          } else if (sizeChanged && tpl.confirmed) {
-            const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
-            tpl.canvas = canvas;
-            tpl.rawIndices = rawIndices;
-            tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
-          }
-          syncTplInputs(tpl);
-          renderTemplateList();
-          markDirty();
-        }
-        break;
-      }
-      case 'template_delete':
-        templates = templates.filter(t => t.id !== msg.id);
-        renderTemplateList();
-        markDirty();
-        break;
-    }
-  });
-
-  ws.addEventListener('close', () => {
-    wsReady = false;
-    updateOnlineChip(null);
-    setTimeout(wsConnect, 3000); // auto-reconnect
-  });
-
-  ws.addEventListener('error', () => { ws.close(); });
-}
-
+let isSupabaseRealtime = false;
+let sbHeartbeatInterval = null;
+let sbMsgRef = 1;
 let wsBatch = [];
 let wsFlushTimer = null;
+
+function connectSupabaseRealtime() {
+  if (sbHeartbeatInterval) { clearInterval(sbHeartbeatInterval); sbHeartbeatInterval = null; }
+  const url = `wss://jtwbuempcdjrbqfgvaar.supabase.co/realtime/v1/websocket?apikey=${SUPABASE_CONFIG.anonKey}&vsn=1.0.0`;
+  
+  try {
+    ws = new WebSocket(url);
+    isSupabaseRealtime = true;
+
+    ws.addEventListener('open', () => {
+      console.log('[Supabase Realtime] Conectado a la red Edge global');
+      wsReady = true;
+      updateOnlineChip(null);
+
+      // Join realtime channel
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'phx_join',
+        payload: { config: { broadcast: { self: false } } },
+        ref: String(sbMsgRef++)
+      }));
+
+      // Start 25s heartbeat ping
+      sbHeartbeatInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(sbMsgRef++) }));
+        }
+      }, 25000);
+    });
+
+    ws.addEventListener('message', async e => {
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.event === 'broadcast' && msg.payload) {
+        const payloadData = msg.payload;
+        const ev = payloadData.event;
+        const p = payloadData.payload;
+        if (!p) return;
+        if (ev === 'pixel') applyRemotePixel(p.x, p.y, p.c);
+        else if (ev === 'batch') (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
+        else if (ev === 'clear') {
+          if (canvasData) { canvasData.fill(0); offCtx.fillStyle='#FFFFFF'; offCtx.fillRect(0,0,CS,CS); markDirty(); }
+        }
+        else if (ev === 'template_add') {
+          if (p.template && !templates.some(t => t.id === p.template.id)) {
+            await addTemplateFromData(p.template);
+            renderTemplateList();
+            markDirty();
+          }
+        }
+        else if (ev === 'template_update') {
+          const tpl = templates.find(t => t.id === p.id);
+          if (tpl && p.updates) {
+            Object.assign(tpl, p.updates);
+            if (p.updates.confirmed && !tpl.confirmed) {
+              tpl.confirmed = true;
+              const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
+              tpl.canvas = canvas; tpl.rawIndices = rawIndices;
+              tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+            }
+            syncTplInputs(tpl);
+            renderTemplateList();
+            markDirty();
+          }
+        }
+        else if (ev === 'template_delete') {
+          templates = templates.filter(t => t.id !== p.id);
+          renderTemplateList();
+          markDirty();
+        }
+      }
+    });
+
+    ws.addEventListener('close', () => {
+      wsReady = false;
+      if (sbHeartbeatInterval) clearInterval(sbHeartbeatInterval);
+      setTimeout(connectSupabaseRealtime, 3000);
+    });
+
+    ws.addEventListener('error', () => { if (ws) ws.close(); });
+  } catch (err) {
+    console.warn('[Supabase Realtime] Error al conectar:', err);
+    setTimeout(connectSupabaseRealtime, 4000);
+  }
+}
+
+function handleStandardWsMessage(msg) {
+  switch (msg.type) {
+    case 'auth_ok':
+      wsReady = true;
+      updateOnlineChip(null);
+      break;
+    case 'pixel':
+      applyRemotePixel(msg.x, msg.y, msg.c);
+      break;
+    case 'batch':
+      (msg.pixels || []).forEach(p => applyRemotePixel(p.x, p.y, p.c));
+      break;
+    case 'clear':
+      if (canvasData) { canvasData.fill(0); offCtx.fillStyle='#FFFFFF'; offCtx.fillRect(0,0,CS,CS); markDirty(); }
+      break;
+    case 'online':
+      updateOnlineChip(msg.count);
+      break;
+    case 'templates_list': {
+      const incoming = msg.templates || [];
+      const loadedList = [];
+      for (let i = 0; i < incoming.length; i++) {
+        addTemplateFromData(incoming[i], loadedList);
+      }
+      templates = loadedList;
+      renderTemplateList();
+      markDirty();
+      break;
+    }
+    case 'template_add':
+      if (!templates.some(t => t.id === msg.template.id)) {
+        addTemplateFromData(msg.template);
+        renderTemplateList();
+        markDirty();
+      }
+      break;
+    case 'template_update': {
+      const tpl = templates.find(t => t.id === msg.id);
+      if (tpl) {
+        tpl.x = msg.updates.x;
+        tpl.y = msg.updates.y;
+        const sizeChanged = tpl.w !== msg.updates.w || tpl.h !== msg.updates.h;
+        tpl.w = msg.updates.w;
+        tpl.h = msg.updates.h;
+        if (msg.updates.confirmed && !tpl.confirmed) {
+          tpl.confirmed = true;
+          const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
+          tpl.canvas = canvas;
+          tpl.rawIndices = rawIndices;
+          tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+        } else if (sizeChanged && tpl.confirmed) {
+          const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
+          tpl.canvas = canvas;
+          tpl.rawIndices = rawIndices;
+          tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+        }
+        syncTplInputs(tpl);
+        renderTemplateList();
+        markDirty();
+      }
+      break;
+    }
+    case 'template_delete':
+      templates = templates.filter(t => t.id !== msg.id);
+      renderTemplateList();
+      markDirty();
+      break;
+  }
+}
+
+function wsConnect() {
+  const isVercel = location.hostname.includes('vercel.app') || location.hostname.includes('now.sh');
+  
+  if (isVercel) {
+    connectSupabaseRealtime();
+    return;
+  }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host;
+
+  try {
+    ws = new WebSocket(url);
+    isSupabaseRealtime = false;
+
+    ws.addEventListener('open', () => {
+      console.log('[WS] Conectado al servidor local');
+      wsReady = true;
+    });
+
+    ws.addEventListener('message', async e => {
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      handleStandardWsMessage(msg);
+    });
+
+    ws.addEventListener('close', () => {
+      wsReady = false;
+      updateOnlineChip(null);
+      // Fallback to Supabase Realtime if local server disconnected
+      setTimeout(connectSupabaseRealtime, 2000);
+    });
+
+    ws.addEventListener('error', () => {
+      if (ws) ws.close();
+    });
+  } catch {
+    connectSupabaseRealtime();
+  }
+}
 
 function queueWSPixel(x, y, ci) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -147,12 +257,33 @@ function flushWSPixels() {
   if (!wsBatch.length) return;
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      if (wsBatch.length === 1) {
-        ws.send(JSON.stringify({ type: 'pixel', x: wsBatch[0].x, y: wsBatch[0].y, c: wsBatch[0].c }));
+      if (isSupabaseRealtime) {
+        if (wsBatch.length === 1) {
+          ws.send(JSON.stringify({
+            topic: 'realtime:bplace',
+            event: 'broadcast',
+            payload: { type: 'broadcast', event: 'pixel', payload: { x: wsBatch[0].x, y: wsBatch[0].y, c: wsBatch[0].c } },
+            ref: String(sbMsgRef++)
+          }));
+        } else {
+          for (let i = 0; i < wsBatch.length; i += 500) {
+            const chunk = wsBatch.slice(i, i + 500);
+            ws.send(JSON.stringify({
+              topic: 'realtime:bplace',
+              event: 'broadcast',
+              payload: { type: 'broadcast', event: 'batch', payload: { pixels: chunk } },
+              ref: String(sbMsgRef++)
+            }));
+          }
+        }
       } else {
-        for (let i = 0; i < wsBatch.length; i += 500) {
-          const chunk = wsBatch.slice(i, i + 500);
-          ws.send(JSON.stringify({ type: 'batch', pixels: chunk }));
+        if (wsBatch.length === 1) {
+          ws.send(JSON.stringify({ type: 'pixel', x: wsBatch[0].x, y: wsBatch[0].y, c: wsBatch[0].c }));
+        } else {
+          for (let i = 0; i < wsBatch.length; i += 500) {
+            const chunk = wsBatch.slice(i, i + 500);
+            ws.send(JSON.stringify({ type: 'batch', pixels: chunk }));
+          }
         }
       }
     } catch (e) {
@@ -244,17 +375,37 @@ function updateOnlineChip(count) {
 }
 
 async function loadCanvasFromServer() {
+  // 1. Try local server endpoint
   try {
-    const res = await fetch('/api/canvas');
-    if (!res.ok) return false;
-    const buf = await res.arrayBuffer();
-    const data = new Uint8Array(buf);
-    if (data.length === CS * CS) {
-      buildCanvasFromData(data);
-      markDirty();
-      return true;
+    const res = await fetch('/api/canvas', { cache: 'no-cache' });
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      const data = new Uint8Array(buf);
+      if (data.length === CS * CS) {
+        buildCanvasFromData(data);
+        markDirty();
+        return true;
+      }
     }
-  } catch (e) { console.warn('[WS] No se pudo cargar canvas del servidor', e); }
+  } catch (e) {}
+
+  // 2. Fallback: Supabase Storage Global CDN (works on Vercel or when server is remote)
+  try {
+    const cdnUrl = SUPABASE_CONFIG.cdnCanvas + '?t=' + Date.now();
+    const res = await fetch(cdnUrl, { cache: 'no-cache' });
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      const data = new Uint8Array(buf);
+      if (data.length === CS * CS) {
+        buildCanvasFromData(data);
+        markDirty();
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn('[CDN] No se pudo cargar canvas desde Supabase CDN', e);
+  }
+
   return false;
 }
 
