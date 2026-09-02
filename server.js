@@ -500,6 +500,74 @@ wss.on('connection', ws => {
 });
 
 // ───────────────────────────────────────────────
+//  SUPABASE REALTIME CLOUD BRIDGE
+// ───────────────────────────────────────────────
+let wsCloudBridge = null;
+
+function connectServerToSupabaseRealtime() {
+  const wsUrl = `wss://jtwbuempcdjrbqfgvaar.supabase.co/realtime/v1/websocket?apikey=${SUPABASE_KEY}&vsn=1.0.0`;
+  try {
+    wsCloudBridge = new WebSocket(wsUrl);
+
+    wsCloudBridge.on('open', () => {
+      console.log('[Supabase Realtime] ✅ Servidor puente conectado a la red global de Supabase.');
+      wsCloudBridge.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'phx_join',
+        payload: { config: { broadcast: { self: false } } },
+        ref: 'srv_join'
+      }));
+
+      setInterval(() => {
+        if (wsCloudBridge && wsCloudBridge.readyState === WebSocket.OPEN) {
+          wsCloudBridge.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: 'srv_hb' }));
+        }
+      }, 25000);
+    });
+
+    wsCloudBridge.on('message', raw => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.event === 'broadcast' && msg.payload) {
+          const { event: ev, payload: p } = msg.payload;
+          if (ev === 'pixel' && p) {
+            if (p.x >= 0 && p.x < CANVAS_SIZE && p.y >= 0 && p.y < CANVAS_SIZE && p.c >= 0 && p.c < PALETTE.length) {
+              canvas[p.y * CANVAS_SIZE + p.x] = p.c;
+              broadcast({ type: 'pixel', x: p.x, y: p.y, c: p.c });
+              scheduleSaveCanvas();
+            }
+          } else if (ev === 'batch' && p && Array.isArray(p.pixels)) {
+            p.pixels.forEach(px => {
+              if (px.x >= 0 && px.x < CANVAS_SIZE && px.y >= 0 && px.y < CANVAS_SIZE && px.c >= 0 && px.c < PALETTE.length) {
+                canvas[px.y * CANVAS_SIZE + px.x] = px.c;
+              }
+            });
+            broadcast({ type: 'batch', pixels: p.pixels });
+            scheduleSaveCanvas();
+          } else if (ev === 'clear') {
+            canvas.fill(0);
+            saveCanvasLocal();
+            broadcast({ type: 'clear' });
+          }
+        }
+      } catch {}
+    });
+
+    wsCloudBridge.on('close', () => {
+      setTimeout(connectServerToSupabaseRealtime, 3000);
+    });
+    wsCloudBridge.on('error', () => {
+      if (wsCloudBridge) wsCloudBridge.close();
+    });
+  } catch (err) {
+    console.warn('[Supabase Realtime] Error al inicializar puente:', err);
+    setTimeout(connectServerToSupabaseRealtime, 4000);
+  }
+}
+
+connectServerToSupabaseRealtime();
+
+// ───────────────────────────────────────────────
 //  START SERVER
 // ───────────────────────────────────────────────
 if (require.main === module) {
