@@ -749,10 +749,19 @@ body.paint-mode #wplace-dock {
 }
 
 .palette-expanded .palette-grid-wplace {
-  flex-wrap: wrap;
-  justify-content: center;
-  max-width: 580px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(30px, 1fr));
   gap: 8px 6px;
+  width: 100%;
+  max-width: 600px;
+  justify-items: center;
+  align-items: center;
+}
+
+.palette-expanded .palette-grid-wplace .swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
 }
 
 .palette-expanded .pal-nav-btn {
@@ -1637,21 +1646,26 @@ body.paint-mode #wplace-dock {
 
   /* Expanded 64-color drawer on mobile */
   .palette-expanded .palette-scroll-wrap {
-    max-height: 140px;
+    max-height: 185px;
     overflow-y: auto;
     overflow-x: hidden;
+    padding: 6px 2px;
   }
 
   .palette-expanded .palette-grid-wplace {
     display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 4px;
+    grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
+    gap: 6px 4px;
+    width: 100%;
     max-width: 100%;
+    justify-items: center;
+    align-items: center;
   }
 
-  .palette-grid-wplace .swatch {
-    width: 20px;
-    height: 20px;
+  .palette-expanded .palette-grid-wplace .swatch {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
   }
 
   .pal-expand-btn {

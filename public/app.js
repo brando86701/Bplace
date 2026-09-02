@@ -535,6 +535,29 @@ async function loadCanvasFromServer() {
   return false;
 }
 
+async function uploadCanvasToCloudStorage() {
+  if (!canvasData) return;
+  try {
+    const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_CONFIG.anonKey,
+        Authorization: 'Bearer ' + SUPABASE_CONFIG.anonKey,
+        'Content-Type': 'application/octet-stream',
+        'x-upsert': 'true'
+      },
+      body: canvasData
+    });
+    if (res.ok) {
+      console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
+    } else {
+      console.warn('[Supabase Storage] Error al subir lienzo a la nube:', res.status);
+    }
+  } catch (e) {
+    console.warn('[Supabase Storage] Error de red al subir lienzo:', e);
+  }
+}
+
 function hexToRGB(h) {
   h = h.replace('#', '');
   const n = parseInt(h, 16);
@@ -2245,14 +2268,16 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 
   $('btn-fit').addEventListener('click',fitCanvas);
-  $('btn-clear').addEventListener('click', () => {
-    if (!confirm('Limpiar todo el canvas?')) return;
+  $('btn-clear').addEventListener('click', async () => {
+    if (!confirm('¿Limpiar todo el canvas? Esta acción borrará el lienzo para todos.')) return;
     offCtx.fillStyle = '#FFFFFF';
     offCtx.fillRect(0, 0, CS, CS);
     if (canvasData) canvasData.fill(0);
     idbSave(canvasData);
     markDirty();
     showToast('Canvas limpiado', '');
+
+    // 1. Broadcast real-time event to all connected users
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         topic: 'realtime:bplace',
@@ -2261,6 +2286,12 @@ window.addEventListener('DOMContentLoaded', async () => {
         ref: String(sbMsgRef++)
       }));
     }
+
+    // 2. Notify local server if running
+    fetch('/api/canvas/clear', { method: 'POST' }).catch(() => {});
+
+    // 3. Immediately persist cleared blank canvas to Supabase Storage CDN
+    await uploadCanvasToCloudStorage();
   });
   $('btn-export').addEventListener('click',()=>{$('export-info').textContent='Tamano: '+(CS*exportScale)+'x'+(CS*exportScale)+' px';$('export-dialog').classList.remove('hidden');});
   const bsIn = $('brush-size'); if (bsIn) bsIn.addEventListener('input', e => setBrushSize(parseInt(e.target.value)));

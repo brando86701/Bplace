@@ -360,11 +360,15 @@ app.post('/api/canvas/save', adminMW, (_req, res) => {
   res.json({ ok: true });
 });
 
-// Clear canvas (admin)
-app.post('/api/canvas/clear', adminMW, (_req, res) => {
+// Clear canvas
+app.post('/api/canvas/clear', (_req, res) => {
+  console.log('[API] 🗑️ Limpiando canvas');
   canvas.fill(0);
-  scheduleSaveCanvas();
+  saveCanvasLocal();
   broadcast({ type: 'clear' });
+  forwardToSupabaseRealtime('clear', {});
+  scheduleSaveCanvas();
+  uploadCanvasToSupabase();
   res.json({ ok: true });
 });
 
@@ -566,10 +570,13 @@ wss.on('connection', ws => {
         break;
       }
       case 'clear': {
+        console.log('[WS] 🗑️ Limpiando canvas por cliente WS');
         canvas.fill(0);
-        scheduleSaveCanvas();
+        saveCanvasLocal();
         broadcast({ type: 'clear' }, ws);
         forwardToSupabaseRealtime('clear', {});
+        scheduleSaveCanvas();
+        uploadCanvasToSupabase();
         break;
       }
     }
@@ -833,9 +840,12 @@ function connectServerToSupabaseRealtime() {
             saveTemplates();
             broadcast({ type: 'template_delete', id: p.id });
           } else if (ev === 'clear') {
+            console.log('[Supabase Realtime] 🗑️ Limpiando canvas por evento remoto');
             canvas.fill(0);
             saveCanvasLocal();
             broadcast({ type: 'clear' });
+            scheduleSaveCanvas();
+            uploadCanvasToSupabase();
           }
         }
       } catch {}
