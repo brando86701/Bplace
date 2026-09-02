@@ -592,7 +592,23 @@ function connectServerToSupabaseRealtime() {
               }
             });
             broadcast({ type: 'batch', pixels: p.pixels });
-            scheduleSaveCanvas();
+          } else if (ev === 'template_add' && p && p.template) {
+            if (!templates.some(t => t.id === p.template.id)) {
+              templates.push(p.template);
+              saveTemplates();
+              broadcast({ type: 'template_add', template: p.template });
+            }
+          } else if (ev === 'template_update' && p && p.id && p.updates) {
+            const tpl = templates.find(t => t.id === p.id);
+            if (tpl) {
+              Object.assign(tpl, p.updates);
+              saveTemplates();
+              broadcast({ type: 'template_update', id: p.id, updates: p.updates });
+            }
+          } else if (ev === 'template_delete' && p && p.id) {
+            templates = templates.filter(t => t.id !== p.id);
+            saveTemplates();
+            broadcast({ type: 'template_delete', id: p.id });
           } else if (ev === 'clear') {
             canvas.fill(0);
             saveCanvasLocal();

@@ -284,20 +284,121 @@ async function addTemplateFromData(saved, list = templates) {
 }
 
 function sendTemplateUpdate(tpl) {
-  if (!wsReady) return;
-  ws.send(JSON.stringify({
-    type: 'template_update',
-    id: tpl.id,
-    updates: {
+  const updates = {
+    x: tpl.x,
+    y: tpl.y,
+    w: tpl.w,
+    h: tpl.h,
+    opacity: tpl.opacity,
+    visible: tpl.visible,
+    confirmed: tpl.confirmed,
+    filterCI: tpl.filterCI
+  };
+
+  // 1. Broadcast to all clients over Supabase Realtime
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      topic: 'realtime:bplace',
+      event: 'broadcast',
+      payload: {
+        type: 'broadcast',
+        event: 'template_update',
+        payload: { id: tpl.id, updates }
+      },
+      ref: String(sbMsgRef++)
+    }));
+  }
+
+  // 2. Persist to Supabase PostgreSQL table
+  fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?id=eq.${tpl.id}`, {
+    method: 'PATCH',
+    headers: {
+      'apikey': SUPABASE_CONFIG.anonKey,
+      'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
       x: tpl.x,
       y: tpl.y,
       w: tpl.w,
       h: tpl.h,
       opacity: tpl.opacity,
       visible: tpl.visible,
-      confirmed: tpl.confirmed
+      confirmed: tpl.confirmed,
+      filter_ci: tpl.filterCI
+    })
+  }).catch(() => {});
+}
+
+function deleteTemplate(tplId) {
+  templates = templates.filter(t => t.id !== tplId);
+  renderTemplateList();
+  markDirty();
+  saveTemplatesToIDB();
+
+  // 1. Broadcast to all clients over Supabase Realtime
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      topic: 'realtime:bplace',
+      event: 'broadcast',
+      payload: {
+        type: 'broadcast',
+        event: 'template_delete',
+        payload: { id: tplId }
+      },
+      ref: String(sbMsgRef++)
+    }));
+  }
+
+  // 2. Delete from Supabase PostgreSQL table
+  fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?id=eq.${tplId}`, {
+    method: 'DELETE',
+    headers: {
+      'apikey': SUPABASE_CONFIG.anonKey,
+      'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey
     }
-  }));
+  }).catch(() => {});
+}
+
+async function loadTemplatesFromCloud() {
+  try {
+    const res = await fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?select=*`, {
+      headers: {
+        'apikey': SUPABASE_CONFIG.anonKey,
+        'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey
+      }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        const loadedList = [];
+        for (let i = 0; i < data.length; i++) {
+          const t = data[i];
+          await addTemplateFromData({
+            id: Number(t.id),
+            name: t.name,
+            origImageURL: t.orig_image_url,
+            x: t.x,
+            y: t.y,
+            w: t.w,
+            h: t.h,
+            opacity: t.opacity,
+            visible: t.visible,
+            confirmed: t.confirmed,
+            filterCI: t.filter_ci
+          }, loadedList);
+        }
+        templates = loadedList;
+        renderTemplateList();
+        markDirty();
+        saveTemplatesToIDB();
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn('[Cloud] No se pudieron cargar plantillas de Supabase:', e);
+  }
+  return false;
 }
 
 function updateOnlineChip(count) {
@@ -672,7 +773,7 @@ function stampTemplate(tpl) {
   if (!tpl.confirmed || !tpl.rawIndices) return;
   const W = Math.round(tpl.w);
   const H = Math.round(tpl.h);
-  const pts = [];
+  const flat = [];
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       const ci = tpl.rawIndices[py * W + px];
@@ -682,23 +783,26 @@ function stampTemplate(tpl) {
       const y = Math.round(tpl.y) + py;
       if (x >= 0 && x < CS && y >= 0 && y < CS) {
         setPixelPalette(x, y, ci);
-        pts.push({ x, y, c: ci });
+        flat.push(x, y, ci);
       }
     }
   }
   markDirty();
   scheduleIDBSave();
   
-  // Send to server if connected
-  if (wsReady && pts.length > 0) {
-    // Send in batches of max 1000 to avoid oversized messages
-    const batchSize = 1000;
-    for (let i = 0; i < pts.length; i += batchSize) {
-      const batch = pts.slice(i, i + batchSize);
-      ws.send(JSON.stringify({ type: 'batch', pixels: batch }));
+  // Broadcast stamped pixels over Supabase Realtime
+  if (ws && ws.readyState === WebSocket.OPEN && flat.length > 0) {
+    for (let i = 0; i < flat.length; i += 6000) {
+      const chunk = flat.slice(i, i + 6000);
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
+        ref: String(sbMsgRef++)
+      }));
     }
   }
-  showToast('Plantilla estampada! (' + pts.length + ' píxeles aplicados', 'success');
+  showToast('Plantilla calcada y sincronizada (' + (flat.length / 3) + ' px)', 'success');
 }
 
 function confirmTemplate(tpl) {
@@ -1284,48 +1388,83 @@ function updatePanelTabIcon(){
 }
 
 /* === Template file loading (FileReader for persistence) === */
-function loadTemplateFile(file){
-  if(templates.length>=MAX_TPLS){showToast('Maximo '+MAX_TPLS+' plantillas','error');return;}
-  const reader=new FileReader();
-  reader.onload=e=>{
-    const dataURL=e.target.result;
-    const img=new Image();
-    img.onload=()=>{
+function loadTemplateFile(file) {
+  if (templates.length >= MAX_TPLS) { showToast('Máximo ' + MAX_TPLS + ' plantillas', 'error'); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const dataURL = e.target.result;
+    const img = new Image();
+    img.onload = () => {
       const tpl = {
-        id:Date.now(),name:file.name,
-        origImage:img,origImageURL:dataURL,
-        canvas:null,rawIndices:null,stitchCanvas:null,
-        filterActive:false,filterCI:-1,filterCanvas:null,
-        x:0,y:0,w:img.naturalWidth,h:img.naturalHeight,
-        opacity:0.85,visible:true,confirmed:false,
+        id: Date.now(),
+        name: file.name,
+        origImage: img,
+        origImageURL: dataURL,
+        canvas: null, rawIndices: null, stitchCanvas: null,
+        filterActive: false, filterCI: -1, filterCanvas: null,
+        x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight,
+        opacity: 0.85, visible: true, confirmed: false,
       };
       templates.push(tpl);
-      renderTemplateList();markDirty();scheduleTemplateSave();
-      
-      // Broadcast addition to other clients
-      if (wsReady) {
+      renderTemplateList();
+      markDirty();
+      saveTemplatesToIDB();
+
+      const payloadTpl = {
+        id: tpl.id,
+        name: tpl.name,
+        origImageURL: tpl.origImageURL,
+        x: tpl.x,
+        y: tpl.y,
+        w: tpl.w,
+        h: tpl.h,
+        opacity: tpl.opacity,
+        visible: tpl.visible,
+        confirmed: tpl.confirmed,
+        filterCI: tpl.filterCI
+      };
+
+      // 1. Broadcast addition to all devices over Supabase Realtime
+      if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
-          type: 'template_add',
-          template: {
-            id: tpl.id,
-            name: tpl.name,
-            origImageURL: tpl.origImageURL,
-            x: tpl.x,
-            y: tpl.y,
-            w: tpl.w,
-            h: tpl.h,
-            opacity: tpl.opacity,
-            visible: tpl.visible,
-            confirmed: tpl.confirmed,
-            filterCI: tpl.filterCI,
-            rawIndices: null
-          }
+          topic: 'realtime:bplace',
+          event: 'broadcast',
+          payload: {
+            type: 'broadcast',
+            event: 'template_add',
+            payload: { template: payloadTpl }
+          },
+          ref: String(sbMsgRef++)
         }));
       }
-      
-      showToast('Plantilla lista. Ajusta con los handles y confirma.','');
+
+      // 2. Persist to Supabase PostgreSQL table
+      fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates`, {
+        method: 'POST',
+        headers: {
+          'apikey': SUPABASE_CONFIG.anonKey,
+          'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify({
+          id: tpl.id,
+          name: tpl.name,
+          orig_image_url: tpl.origImageURL,
+          x: tpl.x,
+          y: tpl.y,
+          w: tpl.w,
+          h: tpl.h,
+          opacity: tpl.opacity,
+          visible: tpl.visible,
+          confirmed: tpl.confirmed,
+          filter_ci: tpl.filterCI
+        })
+      }).catch(err => console.warn('[Supabase] Error saving template:', err));
+
+      showToast('Plantilla cargada y sincronizada en la nube', 'success');
     };
-    img.src=dataURL;
+    img.src = dataURL;
   };
   reader.readAsDataURL(file);
 }
@@ -1435,9 +1574,7 @@ function renderTemplateList(){
       sendTemplateUpdate(tpl);
     });
     div.querySelector('[data-act="del"]').addEventListener('click',()=>{
-      templates=templates.filter(t=>t.id!==tpl.id);
-      renderTemplateList();markDirty();saveTemplatesToIDB();
-      if(wsReady) ws.send(JSON.stringify({type:'template_delete',id:tpl.id}));
+      deleteTemplate(tpl.id);
     });
     const opIn=div.querySelector('.tpl-opacity-inp'),opVal=div.querySelector('.tpl-opacity-val');
     opIn.addEventListener('input',e=>{
@@ -1679,6 +1816,11 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   fitCanvas();
   wsConnect();
+
+  // Load shared templates from Supabase Cloud
+  loadTemplatesFromCloud().then(ok => {
+    if (!ok) loadTemplatesFromIDB();
+  });
 
   /* Theme */
   const savedTheme = localStorage.getItem('bplace_theme') || 'dark';
