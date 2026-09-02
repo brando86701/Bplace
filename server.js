@@ -504,6 +504,41 @@ wss.on('connection', ws => {
 // ───────────────────────────────────────────────
 let wsCloudBridge = null;
 
+function bresenhamLineServer(x0, y0, x1, y1, fn) {
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  for (;;) {
+    fn(x0, y0);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 < dx) { err += dx; y0 += sy; }
+  }
+}
+
+function paintBrushServer(cx, cy, ci, brushSize) {
+  if (ci < 0 || ci >= PALETTE.length) return;
+  const sz = brushSize || 1;
+  if (sz === 1) {
+    if (cx >= 0 && cx < CANVAS_SIZE && cy >= 0 && cy < CANVAS_SIZE) {
+      canvas[cy * CANVAS_SIZE + cx] = ci;
+    }
+    return;
+  }
+  const r = Math.floor(sz / 2);
+  const minX = Math.max(0, cx - r);
+  const maxX = Math.min(CANVAS_SIZE - 1, cx + r);
+  const minY = Math.max(0, cy - r);
+  const maxY = Math.min(CANVAS_SIZE - 1, cy + r);
+  const w = maxX - minX + 1;
+  if (w <= 0 || minY > maxY) return;
+  for (let py = minY; py <= maxY; py++) {
+    const rowOffset = py * CANVAS_SIZE + minX;
+    canvas.fill(ci, rowOffset, rowOffset + w);
+  }
+}
+
 function connectServerToSupabaseRealtime() {
   const wsUrl = `wss://jtwbuempcdjrbqfgvaar.supabase.co/realtime/v1/websocket?apikey=${SUPABASE_KEY}&vsn=1.0.0`;
   try {
@@ -574,6 +609,20 @@ function connectServerToSupabaseRealtime() {
                   }
                 }
               }
+            } else if (p.type === 'line') {
+              const sz = p.size || 1;
+              bresenhamLineServer(p.x0, p.y0, p.x1, p.y1, (x, y) => {
+                paintBrushServer(x, y, p.c, sz);
+              });
+            }
+            scheduleSaveCanvas();
+          } else if (ev === 'lines_batch' && Array.isArray(p)) {
+            const len = p.length;
+            for (let i = 0; i < len; i += 6) {
+              const x0 = p[i], y0 = p[i + 1], x1 = p[i + 2], y1 = p[i + 3], ci = p[i + 4], sz = p[i + 5] || 1;
+              bresenhamLineServer(x0, y0, x1, y1, (x, y) => {
+                paintBrushServer(x, y, ci, sz);
+              });
             }
             scheduleSaveCanvas();
           } else if (ev === 'flat_batch' && Array.isArray(p)) {

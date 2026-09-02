@@ -136,6 +136,16 @@ function connectSupabaseRealtime() {
           }
           markDirty();
           scheduleIDBSave();
+        } else if (ev === 'lines_batch' && Array.isArray(p)) {
+          const prev = brushSize;
+          const len = p.length;
+          for (let i = 0; i < len; i += 6) {
+            brushSize = p[i + 5] || 1;
+            bresenhamLine(p[i], p[i + 1], p[i + 2], p[i + 3], (x, y) => paintBrush(x, y, p[i + 4]));
+          }
+          brushSize = prev;
+          markDirty();
+          scheduleIDBSave();
         } else if (ev === 'batch') {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
         } else if (ev === 'clear') {
@@ -194,6 +204,44 @@ function sendWSShape(shapeData) {
     payload: { type: 'broadcast', event: 'shape', payload: shapeData },
     ref: String(sbMsgRef++)
   }));
+}
+
+let wsLineBatch = [];
+let wsLineTimer = null;
+
+function queueWSLine(x0, y0, x1, y1, ci, size) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  wsLineBatch.push(x0, y0, x1, y1, ci, size);
+  if (!wsLineTimer) {
+    wsLineTimer = setTimeout(flushWSLines, 16);
+  }
+}
+
+function flushWSLines() {
+  wsLineTimer = null;
+  if (!wsLineBatch.length || !ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    if (wsLineBatch.length === 6) {
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: {
+          type: 'broadcast',
+          event: 'shape',
+          payload: { type: 'line', x0: wsLineBatch[0], y0: wsLineBatch[1], x1: wsLineBatch[2], y1: wsLineBatch[3], c: wsLineBatch[4], size: wsLineBatch[5] }
+        },
+        ref: String(sbMsgRef++)
+      }));
+    } else {
+      ws.send(JSON.stringify({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: { type: 'broadcast', event: 'lines_batch', payload: wsLineBatch },
+        ref: String(sbMsgRef++)
+      }));
+    }
+  } catch (e) {}
+  wsLineBatch = [];
 }
 
 function queueWSPixel(x, y, ci) {
@@ -317,25 +365,33 @@ function sendTemplateUpdate(tpl) {
     }));
   }
 
-  // 2. Persist to Supabase PostgreSQL table
-  fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?id=eq.${tpl.id}`, {
-    method: 'PATCH',
-    headers: {
-      'apikey': SUPABASE_CONFIG.anonKey,
-      'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      x: tpl.x,
-      y: tpl.y,
-      w: tpl.w,
-      h: tpl.h,
-      opacity: tpl.opacity,
-      visible: tpl.visible,
-      confirmed: tpl.confirmed,
-      filter_ci: tpl.filterCI
-    })
-  }).catch(() => {});
+  // 2. Debounce persist to Supabase PostgreSQL table (prevents HTTP spam during dragging/resizing)
+  debounceTemplateRestUpdate(tpl);
+}
+
+let tplRestDebounceTimer = null;
+function debounceTemplateRestUpdate(tpl) {
+  if (tplRestDebounceTimer) clearTimeout(tplRestDebounceTimer);
+  tplRestDebounceTimer = setTimeout(() => {
+    fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?id=eq.${tpl.id}`, {
+      method: 'PATCH',
+      headers: {
+        'apikey': SUPABASE_CONFIG.anonKey,
+        'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        x: tpl.x,
+        y: tpl.y,
+        w: tpl.w,
+        h: tpl.h,
+        opacity: tpl.opacity,
+        visible: tpl.visible,
+        confirmed: tpl.confirmed,
+        filter_ci: tpl.filterCI
+      })
+    }).catch(() => {});
+  }, 400);
 }
 
 function deleteTemplate(tplId) {
@@ -532,8 +588,8 @@ let tplDragId = null, tplDragOX = 0, tplDragOY = 0;
 const $ = id => document.getElementById(id);
 const mainCanvas  = $('main-canvas');
 const ghostCanvas = $('ghost-canvas');
-const ctx         = mainCanvas.getContext('2d');
-const ghostCtx    = ghostCanvas.getContext('2d');
+const ctx         = mainCanvas.getContext('2d', { alpha: false, desynchronized: true });
+const ghostCtx    = ghostCanvas.getContext('2d', { desynchronized: true });
 const wrap        = $('canvas-wrap');
 
 /* === Utilities === */
@@ -900,55 +956,13 @@ function render() {
       }
       ctx.imageSmoothingEnabled = false;
     } else {
-      // Confirmed template: draw as small guide dots/squares with batching
-      if (vz >= 3 && tpl.rawIndices) {
-        const dotSize = Math.max(1, Math.round(vz * 0.35));
-        const offset = (vz - dotSize) / 2;
-        const roundedW = Math.round(tpl.w);
-        const roundedH = Math.round(tpl.h);
-        const roundedTplX = Math.round(tpl.x);
-        const roundedTplY = Math.round(tpl.y);
-
-        const startX = Math.max(roundedTplX, Math.floor(vx));
-        const endX = Math.min(roundedTplX + roundedW, Math.ceil(vx + srcW));
-        const startY = Math.max(roundedTplY, Math.floor(vy));
-        const endY = Math.min(roundedTplY + roundedH, Math.ceil(vy + srcH));
-
-        // Group coordinates by color index to batch fillRect calls (massive FPS boost)
-        const buckets = new Array(palRGB.length);
-        for (let y = startY; y < endY; y++) {
-          const py = y - roundedTplY;
-          if (py < 0 || py >= roundedH) continue;
-          const cy = (y - vy) * vz + offset;
-          const rowOffset = py * roundedW;
-          for (let x = startX; x < endX; x++) {
-            const px = x - roundedTplX;
-            if (px < 0 || px >= roundedW) continue;
-            const ci = tpl.rawIndices[rowOffset + px];
-            if (ci < 0) continue;
-            if (tpl.filterActive && tpl.filterCI >= 0 && ci !== tpl.filterCI) continue;
-            const cx = (x - vx) * vz + offset;
-            if (!buckets[ci]) buckets[ci] = [];
-            buckets[ci].push(cx, cy);
-          }
-        }
-
-        for (let ci = 0; ci < buckets.length; ci++) {
-          const coords = buckets[ci];
-          if (!coords || !coords.length) continue;
-          ctx.fillStyle = palRGBStrings[ci];
-          for (let k = 0; k < coords.length; k += 2) {
-            ctx.fillRect(coords[k], coords[k + 1], dotSize, dotSize);
-          }
-        }
-      } else {
-        if (tpl.filterActive && tpl.filterCanvas) {
-          ctx.drawImage(tpl.filterCanvas, tx, ty, tw, th);
-        } else if (tpl.stitchCanvas) {
-          ctx.drawImage(tpl.stitchCanvas, tx, ty, tw, th);
-        } else if (tpl.canvas) {
-          ctx.drawImage(tpl.canvas, tx, ty, tw, th);
-        }
+      // Confirmed template: blit pre-computed stitch/palette canvas directly via GPU (0ms CPU cost!)
+      if (tpl.filterActive && tpl.filterCanvas) {
+        ctx.drawImage(tpl.filterCanvas, tx, ty, tw, th);
+      } else if (tpl.stitchCanvas) {
+        ctx.drawImage(tpl.stitchCanvas, tx, ty, tw, th);
+      } else if (tpl.canvas) {
+        ctx.drawImage(tpl.canvas, tx, ty, tw, th);
       }
     }
     ctx.globalAlpha = 1;
@@ -968,12 +982,14 @@ function render() {
 }
 
 function drawGrid(W, H, srcW, srcH) {
-  ctx.strokeStyle = 'rgba(255,255,255,.04)'; ctx.lineWidth = .5;
+  if (vz < 12) return;
+  ctx.strokeStyle = isLightThemeCached ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
   const x0 = Math.max(0, Math.floor(vx)), y0 = Math.max(0, Math.floor(vy));
   const x1 = Math.min(CS, Math.ceil(vx + srcW)), y1 = Math.min(CS, Math.ceil(vy + srcH));
   ctx.beginPath();
-  for (let x = x0; x <= x1; x++) { const p = (x - vx) * vz; ctx.moveTo(p, 0); ctx.lineTo(p, H); }
-  for (let y = y0; y <= y1; y++) { const p = (y - vy) * vz; ctx.moveTo(0, p); ctx.lineTo(W, p); }
+  for (let x = x0; x <= x1; x++) { const p = Math.round((x - vx) * vz) + 0.5; ctx.moveTo(p, 0); ctx.lineTo(p, H); }
+  for (let y = y0; y <= y1; y++) { const p = Math.round((y - vy) * vz) + 0.5; ctx.moveTo(0, p); ctx.lineTo(W, p); }
   ctx.stroke();
 }
 
@@ -1263,7 +1279,7 @@ function paintLineMain(x0, y0, x1, y1) {
     paintBrush(x, y, ci);
   });
   markDirty();
-  sendWSShape({ type: 'line', x0, y0, x1, y1, c: ci, size: brushSize });
+  queueWSLine(x0, y0, x1, y1, ci, brushSize);
 }
 
 function commitShape(x0, y0, x1, y1) {
@@ -1280,11 +1296,11 @@ function commitShape(x0, y0, x1, y1) {
     sendWSShape({ type: 'circle', cx, cy, a, b, c: ci, fill: shapeFilled });
   } else if (tool === 'line') {
     paintLineMain(x0, y0, x1, y1);
-    sendWSShape({ type: 'line', x0, y0, x1, y1, c: ci, size: brushSize });
   }
   markDirty();
   scheduleIDBSave();
   flushWSPixels();
+  flushWSLines();
 }
 
 /* === Canvas draw event handlers === */
@@ -1302,7 +1318,7 @@ function onMouseDown(e){
   if(tool==='erase'){
     const ci=0; // Index 0 is white
     paintBrush(x,y,ci);
-    sendWSShape({ type: 'line', x0: x, y0: y, x1: x, y1: y, c: ci, size: brushSize });
+    queueWSLine(x,y,x,y,0,brushSize);
     markDirty();
   }
   else paintPixelMain(x,y);
@@ -1319,7 +1335,7 @@ function onMouseMove(e){
         paintLineMain(spLX,spLY,x,y);
       } else {
         paintBrush(x,y,ci);
-        sendWSShape({ type: 'line', x0: x, y0: y, x1: x, y1: y, c: ci, size: brushSize });
+        queueWSLine(x,y,x,y,ci,brushSize);
       }
       markDirty();
       spLX=x;spLY=y;
@@ -1334,7 +1350,7 @@ function onMouseMove(e){
       const ci=0;
       if(x!==drawLX||y!==drawLY){
         bresenhamLine(drawLX,drawLY,x,y,(px,py)=>{paintBrush(px,py,ci);});
-        sendWSShape({ type: 'line', x0: drawLX, y0: drawLY, x1: x, y1: y, c: 0, size: brushSize });
+        queueWSLine(drawLX,drawLY,x,y,0,brushSize);
         markDirty();
       }
       drawLX=x;drawLY=y;
@@ -1344,7 +1360,7 @@ function onMouseMove(e){
 function onMouseUp(e){
   if(panning){panning=false;wrap.classList.remove('panning');return;}
   if(shapeStart&&e.button===0){const rect=mainCanvas.getBoundingClientRect(),{x,y}=s2c(e.clientX-rect.left,e.clientY-rect.top);clearGhost();commitShape(shapeStart.x,shapeStart.y,x,y);shapeStart=null;return;}
-  if(drawing){drawing=false;drawLX=-1;drawLY=-1;scheduleIDBSave();flushWSPixels();}
+  if(drawing){drawing=false;drawLX=-1;drawLY=-1;scheduleIDBSave();flushWSPixels();flushWSLines();}
 }
 function onMouseLeave(){$('px-cursor').classList.add('hidden');$('coord-display').textContent='- , -';mainCanvas.style.cursor='';drawing=false;if(panning){panning=false;wrap.classList.remove('panning');}}
 function onWheel(e){e.preventDefault();const r=mainCanvas.getBoundingClientRect();doZoom(e.deltaY<0?1.15:1/1.15,e.clientX-r.left,e.clientY-r.top);}
