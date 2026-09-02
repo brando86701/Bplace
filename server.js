@@ -242,7 +242,7 @@ function scheduleSaveCanvas() {
   saveCanvasLocal();
   isCloudCanvasDirty = true;
   if (cloudSaveTimer) clearTimeout(cloudSaveTimer);
-  cloudSaveTimer = setTimeout(uploadCanvasToSupabase, 1000); // 1s debounce for cloud upload
+  cloudSaveTimer = setTimeout(uploadCanvasToSupabase, 15000); // 15s debounce to prevent bandwidth congestion
 }
 
 // Background periodic sync

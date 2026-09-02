@@ -1644,18 +1644,18 @@ body.paint-mode #wplace-dock {
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Expanded 64-color drawer on mobile */
+  /* Expanded 64-color drawer on mobile: compact & fills space without taking too much room */
   .palette-expanded .palette-scroll-wrap {
-    max-height: 185px;
+    max-height: 135px;
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 6px 2px;
+    padding: 4px 2px;
   }
 
   .palette-expanded .palette-grid-wplace {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
-    gap: 6px 4px;
+    grid-template-columns: repeat(auto-fill, minmax(22px, 1fr));
+    gap: 5px 3px;
     width: 100%;
     max-width: 100%;
     justify-items: center;
@@ -1663,8 +1663,8 @@ body.paint-mode #wplace-dock {
   }
 
   .palette-expanded .palette-grid-wplace .swatch {
-    width: 28px;
-    height: 28px;
+    width: 22px;
+    height: 22px;
     border-radius: 50%;
   }
 

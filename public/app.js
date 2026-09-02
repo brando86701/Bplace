@@ -150,8 +150,15 @@ function connectSupabaseRealtime() {
           executeFloodFill(p.x, p.y, p.c);
         } else if (ev === 'stamp_template' && p) {
           const tpl = templates.find(t => String(t.id) === String(p.id));
-          if (tpl && tpl.rawIndices) {
-            applyStampTemplate(tpl, p.x, p.y, p.filterCI);
+          if (tpl) {
+            if (!tpl.rawIndices && tpl.origImage) {
+              const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
+              tpl.canvas = canvas; tpl.rawIndices = rawIndices;
+              tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+            }
+            if (tpl.rawIndices) {
+              applyStampTemplate(tpl, p.x, p.y, p.filterCI);
+            }
           }
         } else if (ev === 'batch') {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
@@ -162,27 +169,40 @@ function connectSupabaseRealtime() {
           markDirty();
           scheduleIDBSave();
         } else if (ev === 'template_add') {
-          if (p.template && !templates.some(t => t.id === p.template.id)) {
+          if (p.template && !templates.some(t => String(t.id) === String(p.template.id))) {
             await addTemplateFromData(p.template);
             renderTemplateList();
             markDirty();
           }
         } else if (ev === 'template_update') {
-          const tpl = templates.find(t => t.id === p.id);
+          const tpl = templates.find(t => String(t.id) === String(p.id));
           if (tpl && p.updates) {
+            const needIndices = (p.updates.confirmed && !tpl.confirmed) || (!tpl.rawIndices && (tpl.confirmed || p.updates.confirmed));
             Object.assign(tpl, p.updates);
-            if (p.updates.confirmed && !tpl.confirmed) {
+            if (needIndices) {
               tpl.confirmed = true;
-              const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, Math.max(10, Math.round(tpl.w)), Math.max(10, Math.round(tpl.h)));
-              tpl.canvas = canvas; tpl.rawIndices = rawIndices;
-              tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+              const setupCanvas = (img) => {
+                const W = Math.max(10, Math.round(tpl.w)), H = Math.max(10, Math.round(tpl.h));
+                const { canvas, rawIndices } = buildPaletteCanvas(img, W, H);
+                tpl.canvas = canvas; tpl.rawIndices = rawIndices;
+                tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
+                if (tpl.filterCI >= 0) tpl.filterCanvas = makeFilterStitchCanvas(rawIndices, tpl.w, tpl.h, tpl.filterCI);
+                markDirty();
+              };
+              if (tpl.origImage && (tpl.origImage.complete || tpl.origImage.naturalWidth)) {
+                setupCanvas(tpl.origImage);
+              } else if (tpl.origImageURL) {
+                const img = new Image();
+                img.onload = () => { tpl.origImage = img; setupCanvas(img); };
+                img.src = tpl.origImageURL;
+              }
             }
             syncTplInputs(tpl);
             renderTemplateList();
             markDirty();
           }
         } else if (ev === 'template_delete') {
-          templates = templates.filter(t => t.id !== p.id);
+          templates = templates.filter(t => String(t.id) !== String(p.id));
           renderTemplateList();
           markDirty();
         }
@@ -538,6 +558,7 @@ async function loadCanvasFromServer() {
 async function uploadCanvasToCloudStorage() {
   if (!canvasData) return;
   try {
+    const blob = new Blob([canvasData], { type: 'application/octet-stream' });
     const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
       method: 'POST',
       headers: {
@@ -546,7 +567,7 @@ async function uploadCanvasToCloudStorage() {
         'Content-Type': 'application/octet-stream',
         'x-upsert': 'true'
       },
-      body: canvasData
+      body: blob
     });
     if (res.ok) {
       console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
@@ -1186,16 +1207,22 @@ function stampTemplate(tpl) {
       ref: String(sbMsgRef++)
     }));
 
-    // 2. Stream flat_batch chunks to guarantee persistence and sync on all devices
-    for (let i = 0; i < flat.length; i += 30000) {
-      const chunk = flat.slice(i, i + 30000);
+    // 2. Stream flat_batch chunks with pacing so the socket buffer never overflows
+    let chunkIdx = 0;
+    const CHUNK_SIZE = 9000;
+    function sendNextChunk() {
+      if (!ws || ws.readyState !== WebSocket.OPEN || chunkIdx >= flat.length) return;
+      const chunk = flat.slice(chunkIdx, chunkIdx + CHUNK_SIZE);
+      chunkIdx += CHUNK_SIZE;
       ws.send(JSON.stringify({
         topic: 'realtime:bplace',
         event: 'broadcast',
         payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
         ref: String(sbMsgRef++)
       }));
+      if (chunkIdx < flat.length) setTimeout(sendNextChunk, 35);
     }
+    setTimeout(sendNextChunk, 35);
   }
   showToast('Plantilla calcada y sincronizada (' + Math.round(flat.length / 3) + ' px)', 'success');
 }
