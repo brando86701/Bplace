@@ -118,12 +118,20 @@ function connectSupabaseRealtime() {
           scheduleIDBSave();
         } else if (ev === 'flat_batch' && Array.isArray(p)) {
           const len = p.length;
+          const colorBuckets = {};
           for (let i = 0; i < len; i += 3) {
             const x = p[i], y = p[i + 1], ci = p[i + 2];
             if (x >= 0 && x < CS && y >= 0 && y < CS && ci >= 0 && ci < palRGB.length) {
-              offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
-              offCtx.fillRect(x, y, 1, 1);
               if (canvasData) canvasData[y * CS + x] = ci;
+              if (!colorBuckets[ci]) colorBuckets[ci] = [];
+              colorBuckets[ci].push(x, y);
+            }
+          }
+          for (const ci in colorBuckets) {
+            const coords = colorBuckets[ci];
+            offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+            for (let k = 0; k < coords.length; k += 2) {
+              offCtx.fillRect(coords[k], coords[k + 1], 1, 1);
             }
           }
           markDirty();
@@ -872,17 +880,24 @@ function render() {
   const tplCount = templates.length;
   for (let i = 0; i < tplCount; i++) {
     const tpl = templates[i];
-    if (!tpl.visible) return;
+    if (!tpl || tpl.visible === false) continue;
     const tx = Math.round((tpl.x - vx) * vz), ty = Math.round((tpl.y - vy) * vz);
     const tw = Math.round(tpl.w * vz),      th = Math.round(tpl.h * vz);
     if (tw <= 0 || th <= 0) continue;
     // Viewport Culling
     if (tx + tw < 0 || tx > W || ty + th < 0 || ty > H) continue;
 
-    ctx.globalAlpha = tpl.opacity;
+    ctx.globalAlpha = tpl.opacity !== undefined ? tpl.opacity : 0.85;
     if (!tpl.confirmed) {
       ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(tpl.origImage, tx, ty, tw, th);
+      if (tpl.origImage && (tpl.origImage.complete || tpl.origImage.naturalWidth)) {
+        ctx.drawImage(tpl.origImage, tx, ty, tw, th);
+      } else if (tpl.origImageURL) {
+        const img = new Image();
+        img.onload = () => { tpl.origImage = img; markDirty(); };
+        img.src = tpl.origImageURL;
+        tpl.origImage = img;
+      }
       ctx.imageSmoothingEnabled = false;
     } else {
       // Confirmed template: draw as small guide dots/squares with batching
@@ -937,14 +952,16 @@ function render() {
       }
     }
     ctx.globalAlpha = 1;
-    ctx.strokeStyle = !tpl.confirmed ? 'rgba(255,220,50,.9)' : tpl.filterActive ? (tpl.filterCI >= 0 ? paletteHex[tpl.filterCI] : '#fff') : 'rgba(90,150,255,.5)';
-    ctx.lineWidth = tpl.confirmed ? 1 : 2;
-    ctx.setLineDash([5, 4]); ctx.strokeRect(tx + .5, ty + .5, tw - 1, th - 1); ctx.setLineDash([]);
+    ctx.strokeStyle = !tpl.confirmed ? 'rgba(255,220,50,.95)' : tpl.filterActive ? (tpl.filterCI >= 0 ? paletteHex[tpl.filterCI] : '#fff') : 'rgba(90,150,255,.5)';
+    ctx.lineWidth = !tpl.confirmed ? 2.5 : 1;
+    ctx.setLineDash(!tpl.confirmed ? [6, 4] : [4, 4]);
+    ctx.strokeRect(tx + .5, ty + .5, tw - 1, th - 1);
+    ctx.setLineDash([]);
     if (!tpl.confirmed) {
       getHandlePositions(tx, ty, tw, th).forEach(h => {
-        ctx.beginPath(); ctx.arc(h.sx, h.sy, 6, 0, Math.PI * 2);
+        ctx.beginPath(); ctx.arc(h.sx, h.sy, 7, 0, Math.PI * 2);
         ctx.fillStyle = '#4a9eff'; ctx.fill();
-        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.stroke();
       });
     }
   }
@@ -1128,7 +1145,29 @@ function updateHover(sx, sy) {
 /* === Painting === */
 function floodFill(sx,sy,newHex){if(!canvasData)return;const ni=nearestPaletteIndex(newHex);const idx0=sy*CS+sx;const oi=canvasData[idx0];if(oi===ni)return;const q=[idx0],v=new Uint8Array(CS*CS);v[idx0]=1;while(q.length){const ci=q.pop(),cx=ci%CS;canvasData[ci]=ni;offCtx.putImageData(PAL_ID[ni],cx,Math.floor(ci/CS));for(const nn of[ci-1,ci+1,ci-CS,ci+CS]){if(nn<0||nn>=CS*CS||v[nn])continue;if(Math.abs((nn%CS)-cx)>1)continue;if(canvasData[nn]===oi){v[nn]=1;q.push(nn);}}}markDirty();scheduleIDBSave();}
 function bresenhamLine(x0,y0,x1,y1,fn){const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let err=dx-dy;for(;;){fn(x0,y0);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-dy){err-=dy;x0+=sx;}if(e2<dx){err+=dx;y0+=sy;}}}
-function paintBrush(cx,cy,ci){const r=Math.floor(brushSize/2);if(brushSize===1){if(inCanvas(cx,cy))setPixelPalette(cx,cy,ci);return;}for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){const px=cx+dx,py=cy+dy;if(inCanvas(px,py))setPixelPalette(px,py,ci);}}
+function paintBrush(cx, cy, ci) {
+  const r = Math.floor(brushSize / 2);
+  if (brushSize === 1) {
+    if (inCanvas(cx, cy)) setPixelPalette(cx, cy, ci);
+    return;
+  }
+  const minX = Math.max(0, cx - r);
+  const maxX = Math.min(CS - 1, cx + r);
+  const minY = Math.max(0, cy - r);
+  const maxY = Math.min(CS - 1, cy + r);
+  const w = maxX - minX + 1;
+  const h = maxY - minY + 1;
+  if (w <= 0 || h <= 0) return;
+
+  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  offCtx.fillRect(minX, minY, w, h);
+  if (canvasData) {
+    for (let py = minY; py <= maxY; py++) {
+      const rowOffset = py * CS + minX;
+      canvasData.fill(ci, rowOffset, rowOffset + w);
+    }
+  }
+}
 function paintRect(x0, y0, x1, y1, ci, f) {
   const lx = Math.max(0, Math.min(x0, x1));
   const rx = Math.min(CS - 1, Math.max(x0, x1));
@@ -1211,16 +1250,20 @@ function paintPixelMain(x, y) {
   const ci = currentPaletteCI;
   paintBrush(x, y, ci);
   markDirty();
-  queueWSPixel(x, y, ci);
+  if (brushSize === 1) {
+    queueWSPixel(x, y, ci);
+  } else {
+    sendWSShape({ type: 'line', x0: x, y0: y, x1: x, y1: y, c: ci, size: brushSize });
+  }
 }
 
 function paintLineMain(x0, y0, x1, y1) {
   const ci = currentPaletteCI;
   bresenhamLine(x0, y0, x1, y1, (x, y) => {
     paintBrush(x, y, ci);
-    queueWSPixel(x, y, ci);
   });
   markDirty();
+  sendWSShape({ type: 'line', x0, y0, x1, y1, c: ci, size: brushSize });
 }
 
 function commitShape(x0, y0, x1, y1) {
@@ -1259,8 +1302,8 @@ function onMouseDown(e){
   if(tool==='erase'){
     const ci=0; // Index 0 is white
     paintBrush(x,y,ci);
+    sendWSShape({ type: 'line', x0: x, y0: y, x1: x, y1: y, c: ci, size: brushSize });
     markDirty();
-    wsSendPixel(x,y,ci);
   }
   else paintPixelMain(x,y);
 }
@@ -1272,8 +1315,12 @@ function onMouseMove(e){
   if(spaceHeld&&inCanvas(x,y)){
     if(tool==='brush'||tool==='erase'){
       const ci=tool==='erase'?0:currentPaletteCI;
-      if(spLX>=0)bresenhamLine(spLX,spLY,x,y,(px,py)=>{paintBrush(px,py,ci);queueWSPixel(px,py,ci);});
-      else {paintBrush(x,y,ci);queueWSPixel(x,y,ci);}
+      if(spLX>=0) {
+        paintLineMain(spLX,spLY,x,y);
+      } else {
+        paintBrush(x,y,ci);
+        sendWSShape({ type: 'line', x0: x, y0: y, x1: x, y1: y, c: ci, size: brushSize });
+      }
       markDirty();
       spLX=x;spLY=y;
     }
@@ -1285,8 +1332,11 @@ function onMouseMove(e){
       drawLX=x;drawLY=y;
     }else if(tool==='erase'){
       const ci=0;
-      if(x!==drawLX||y!==drawLY)bresenhamLine(drawLX,drawLY,x,y,(px,py)=>{paintBrush(px,py,ci);queueWSPixel(px,py,ci);});
-      markDirty();
+      if(x!==drawLX||y!==drawLY){
+        bresenhamLine(drawLX,drawLY,x,y,(px,py)=>{paintBrush(px,py,ci);});
+        sendWSShape({ type: 'line', x0: drawLX, y0: drawLY, x1: x, y1: y, c: 0, size: brushSize });
+        markDirty();
+      }
       drawLX=x;drawLY=y;
     }
   }
@@ -1395,6 +1445,25 @@ function loadTemplateFile(file) {
     const dataURL = e.target.result;
     const img = new Image();
     img.onload = () => {
+      // Calculate position at current center of user viewport
+      const viewW = mainCanvas.width / vz;
+      const viewH = mainCanvas.height / vz;
+      const maxInitialDim = Math.min(600, Math.round(Math.min(viewW, viewH) * 0.7));
+      let initW = img.naturalWidth || 200;
+      let initH = img.naturalHeight || 200;
+      if (initW > maxInitialDim || initH > maxInitialDim) {
+        const aspect = initW / initH;
+        if (aspect >= 1) {
+          initW = maxInitialDim;
+          initH = Math.max(10, Math.round(maxInitialDim / aspect));
+        } else {
+          initH = maxInitialDim;
+          initW = Math.max(10, Math.round(maxInitialDim * aspect));
+        }
+      }
+      const initX = Math.round(clamp(vx + (viewW - initW) / 2, 0, CS - initW));
+      const initY = Math.round(clamp(vy + (viewH - initH) / 2, 0, CS - initH));
+
       const tpl = {
         id: Date.now(),
         name: file.name,
@@ -1402,13 +1471,21 @@ function loadTemplateFile(file) {
         origImageURL: dataURL,
         canvas: null, rawIndices: null, stitchCanvas: null,
         filterActive: false, filterCI: -1, filterCanvas: null,
-        x: 0, y: 0, w: img.naturalWidth, h: img.naturalHeight,
+        x: initX, y: initY, w: initW, h: initH,
         opacity: 0.85, visible: true, confirmed: false,
       };
       templates.push(tpl);
       renderTemplateList();
       markDirty();
       saveTemplatesToIDB();
+
+      // Open template panel if closed so user sees the size controls
+      const tplPanel = $('tpl-panel');
+      if (tplPanel) {
+        tplPanel.classList.remove('hidden');
+        tplPanel.classList.remove('collapsed');
+        updatePanelTabIcon();
+      }
 
       const payloadTpl = {
         id: tpl.id,
