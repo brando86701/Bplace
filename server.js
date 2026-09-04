@@ -156,6 +156,27 @@ function saveCanvasLocal() {
   } catch {}
 }
 
+let isLocalCanvasDirty = false;
+let localSaveTimer = null;
+let localSaveInFlight = false;
+
+function flushCanvasLocalAsync() {
+  localSaveTimer = null;
+  if (!isLocalCanvasDirty || localSaveInFlight) return;
+  isLocalCanvasDirty = false;
+  localSaveInFlight = true;
+  // Copy once per grouped save so later pixel writes cannot mutate the data
+  // while Node is streaming it to disk.
+  const snapshot = Buffer.from(canvas);
+  fs.writeFile(CANVAS_FILE, snapshot, err => {
+    localSaveInFlight = false;
+    if (err) console.warn('[Local] No se pudo guardar el lienzo:', err.message);
+    if (isLocalCanvasDirty && !localSaveTimer) {
+      localSaveTimer = setTimeout(flushCanvasLocalAsync, 1000);
+    }
+  });
+}
+
 // ───────────────────────────────────────────────
 //  CLOUD SYNC (SUPABASE)
 // ───────────────────────────────────────────────
@@ -192,7 +213,7 @@ async function syncFromSupabase() {
         opacity: t.opacity,
         visible: t.visible,
         confirmed: t.confirmed,
-        filterCI: t.filter_ci
+        filterCI: -1
       }));
       saveServerTemplatesLocal();
       console.log(`[Supabase] ✅ ${serverTemplates.length} plantillas sincronizadas desde PostgreSQL.`);
@@ -226,12 +247,13 @@ async function uploadCanvasToSupabase() {
   isUploadingToCloud = true;
   isCloudCanvasDirty = false;
   try {
-    const buf = Buffer.from(canvas.buffer, canvas.byteOffset, canvas.byteLength);
+    const buf = Buffer.from(canvas);
     const res = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', buf);
     if (res.status === 200 || res.status === 201) {
       console.log('[Supabase] ✅ Lienzo guardado exitosamente en Storage CDN.');
     }
   } catch (err) {
+    isCloudCanvasDirty = true;
     console.warn('[Supabase] Aviso al sincronizar canvas con Storage:', err.message);
   } finally {
     isUploadingToCloud = false;
@@ -239,10 +261,17 @@ async function uploadCanvasToSupabase() {
 }
 
 function scheduleSaveCanvas() {
-  saveCanvasLocal();
+  isLocalCanvasDirty = true;
+  if (!localSaveTimer && !localSaveInFlight) {
+    localSaveTimer = setTimeout(flushCanvasLocalAsync, 1000);
+  }
   isCloudCanvasDirty = true;
-  if (cloudSaveTimer) clearTimeout(cloudSaveTimer);
-  cloudSaveTimer = setTimeout(uploadCanvasToSupabase, 15000); // 15s debounce to prevent bandwidth congestion
+  if (!cloudSaveTimer) {
+    cloudSaveTimer = setTimeout(() => {
+      cloudSaveTimer = null;
+      uploadCanvasToSupabase();
+    }, 15000);
+  }
 }
 
 // Background periodic sync
@@ -414,6 +443,7 @@ wss.on('connection', ws => {
       case 'template_add': {
         const { template } = msg;
         if (template && template.rawIndices) delete template.rawIndices;
+        if (template) template.filterCI = -1;
         if (template && !serverTemplates.some(t => t.id === template.id)) {
           serverTemplates.push(template);
           saveServerTemplatesLocal();
@@ -439,6 +469,10 @@ wss.on('connection', ws => {
       case 'template_update': {
         const { id, updates } = msg;
         if (updates && updates.rawIndices) delete updates.rawIndices;
+        if (updates) {
+          delete updates.filterCI;
+          delete updates.filterActive;
+        }
         const t = serverTemplates.find(t => t.id === id);
         if (t) {
           Object.assign(t, updates);
@@ -453,8 +487,7 @@ wss.on('connection', ws => {
             h: t.h,
             opacity: t.opacity,
             visible: t.visible,
-            confirmed: t.confirmed,
-            filter_ci: t.filterCI
+            confirmed: t.confirmed
           }).catch(() => {});
         }
         break;
@@ -489,7 +522,7 @@ wss.on('connection', ws => {
         break;
       }
       case 'stamp_template': {
-        const tpl = templates.find(t => t.id === msg.id);
+        const tpl = serverTemplates.find(t => t.id === msg.id);
         if (tpl && tpl.rawIndices) {
           applyStampServer(tpl, msg.x, msg.y, msg.filterCI);
         }
@@ -591,6 +624,7 @@ wss.on('connection', ws => {
 // ───────────────────────────────────────────────
 let wsCloudBridge = null;
 let srvRef = 1000;
+let cloudHeartbeatInterval = null;
 
 function forwardToSupabaseRealtime(event, payload) {
   if (wsCloudBridge && wsCloudBridge.readyState === WebSocket.OPEN) {
@@ -720,7 +754,8 @@ function connectServerToSupabaseRealtime() {
         ref: 'srv_join'
       }));
 
-      setInterval(() => {
+      if (cloudHeartbeatInterval) clearInterval(cloudHeartbeatInterval);
+      cloudHeartbeatInterval = setInterval(() => {
         if (wsCloudBridge && wsCloudBridge.readyState === WebSocket.OPEN) {
           wsCloudBridge.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: 'srv_hb' }));
         }
@@ -789,7 +824,7 @@ function connectServerToSupabaseRealtime() {
             broadcast({ type: 'fill', x: p.x, y: p.y, c: p.c });
             scheduleSaveCanvas();
           } else if (ev === 'stamp_template' && p) {
-            const tpl = templates.find(t => t.id === p.id);
+            const tpl = serverTemplates.find(t => t.id === p.id);
             if (tpl && tpl.rawIndices) {
               applyStampServer(tpl, p.x, p.y, p.filterCI);
             }
@@ -823,20 +858,23 @@ function connectServerToSupabaseRealtime() {
             });
             broadcast({ type: 'batch', pixels: p.pixels });
           } else if (ev === 'template_add' && p && p.template) {
-            if (!templates.some(t => t.id === p.template.id)) {
-              templates.push(p.template);
+            p.template.filterCI = -1;
+            if (!serverTemplates.some(t => t.id === p.template.id)) {
+              serverTemplates.push(p.template);
               saveTemplates();
               broadcast({ type: 'template_add', template: p.template });
             }
           } else if (ev === 'template_update' && p && p.id && p.updates) {
-            const tpl = templates.find(t => t.id === p.id);
+            delete p.updates.filterCI;
+            delete p.updates.filterActive;
+            const tpl = serverTemplates.find(t => t.id === p.id);
             if (tpl) {
               Object.assign(tpl, p.updates);
               saveTemplates();
               broadcast({ type: 'template_update', id: p.id, updates: p.updates });
             }
           } else if (ev === 'template_delete' && p && p.id) {
-            templates = templates.filter(t => t.id !== p.id);
+            serverTemplates = serverTemplates.filter(t => t.id !== p.id);
             saveTemplates();
             broadcast({ type: 'template_delete', id: p.id });
           } else if (ev === 'clear') {
@@ -852,6 +890,10 @@ function connectServerToSupabaseRealtime() {
     });
 
     wsCloudBridge.on('close', () => {
+      if (cloudHeartbeatInterval) {
+        clearInterval(cloudHeartbeatInterval);
+        cloudHeartbeatInterval = null;
+      }
       setTimeout(connectServerToSupabaseRealtime, 3000);
     });
     wsCloudBridge.on('error', () => {

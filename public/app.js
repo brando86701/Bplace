@@ -16,6 +16,7 @@ const MAX_RECENT  = 8;
 const MAX_FAVS    = 8;
 const STITCH_CELL = 4;
 const STITCH_GAP  = 1;
+const IS_COARSE_POINTER = window.matchMedia('(pointer: coarse)').matches;
 
 const BASE_PALETTE = [
   // Row 1 (32 Colors: Index 0 is White #FFFFFF, Neutrals, Reds, Oranges, Yellows, Olives, Greens, Cyans, Ocean Blues, Violets)
@@ -49,6 +50,80 @@ let sbMsgRef = 1;
 let wsBatch = [];
 let wsFlushTimer = null;
 let presenceUsers = new Set();
+const pendingTemplateLoads = new Set();
+
+function announceTemplateRefresh(tpl) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const payload = typeof tpl === 'object' ? {
+    id: tpl.id, name: tpl.name, x: tpl.x, y: tpl.y, w: tpl.w, h: tpl.h,
+    opacity: tpl.opacity, visible: tpl.visible, confirmed: true
+  } : { id: tpl };
+  ws.send(JSON.stringify({
+    topic: 'realtime:bplace',
+    event: 'broadcast',
+    payload: { type: 'broadcast', event: 'template_refresh', payload },
+    ref: String(sbMsgRef++)
+  }));
+}
+
+function ensureRemoteTemplatePlaceholder(data) {
+  if (!data || data.id === undefined || templates.some(t => String(t.id) === String(data.id))) return;
+  templates.push({
+    id: Number(data.id), name: data.name || 'Cargando plantilla…',
+    x: data.x || 0, y: data.y || 0, w: data.w || 10, h: data.h || 10,
+    opacity: data.opacity ?? 0.85, visible: data.visible !== false,
+    confirmed: true, remoteLoading: true,
+    origImage: null, origImageURL: '', canvas: null, rawIndices: null, stitchCanvas: null,
+    filterActive: false, filterCI: -1, filterCanvas: null
+  });
+  renderTemplateList();
+}
+
+async function fetchAndAddCloudTemplate(templateId) {
+  const key = String(templateId);
+  const current = templates.find(t => String(t.id) === key);
+  if (!key || (current && !current.remoteLoading) || pendingTemplateLoads.has(key)) return;
+  pendingTemplateLoads.add(key);
+  try {
+    for (let attempt = 0; attempt < 14; attempt++) {
+      try {
+        const res = await fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates?id=eq.${encodeURIComponent(key)}&select=*`, {
+          headers: {
+            'apikey': SUPABASE_CONFIG.anonKey,
+            'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey
+          },
+          cache: 'no-store'
+        });
+        if (res.ok) {
+          const rows = await res.json();
+          const t = Array.isArray(rows) ? rows[0] : null;
+          if (t) {
+            const loaded = [];
+            await addTemplateFromData({
+              id: Number(t.id), name: t.name, origImageURL: t.orig_image_url,
+              x: t.x, y: t.y, w: t.w, h: t.h,
+              opacity: t.opacity, visible: t.visible, confirmed: t.confirmed
+            }, loaded);
+            const fresh = loaded[0];
+            if (!fresh) throw new Error('Plantilla inválida');
+            const existingIndex = templates.findIndex(existing => String(existing.id) === key);
+            if (existingIndex >= 0) templates[existingIndex] = fresh;
+            else templates.push(fresh);
+            renderTemplateList();
+            markDirty();
+            saveTemplatesToIDB();
+            showToast('Nueva plantilla sincronizada', 'success');
+            return;
+          }
+        }
+      } catch (_) {}
+      await new Promise(resolve => setTimeout(resolve, 250 + attempt * 75));
+    }
+    console.warn('[Templates] No se pudo obtener a tiempo la plantilla', key);
+  } finally {
+    pendingTemplateLoads.delete(key);
+  }
+}
 
 function connectSupabaseRealtime() {
   if (sbHeartbeatInterval) { clearInterval(sbHeartbeatInterval); sbHeartbeatInterval = null; }
@@ -129,7 +204,7 @@ function connectSupabaseRealtime() {
           }
           for (const ci in colorBuckets) {
             const coords = colorBuckets[ci];
-            offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+            setOffscreenPaletteColor(Number(ci));
             for (let k = 0; k < coords.length; k += 2) {
               offCtx.fillRect(coords[k], coords[k + 1], 1, 1);
             }
@@ -164,7 +239,7 @@ function connectSupabaseRealtime() {
           (p.pixels || []).forEach(px => applyRemotePixel(px.x, px.y, px.c));
         } else if (ev === 'clear') {
           if (canvasData) canvasData.fill(0);
-          offCtx.fillStyle = '#FFFFFF';
+          setOffscreenPaletteColor(0);
           offCtx.fillRect(0, 0, CS, CS);
           markDirty();
           scheduleIDBSave();
@@ -174,11 +249,17 @@ function connectSupabaseRealtime() {
             renderTemplateList();
             markDirty();
           }
+        } else if (ev === 'template_refresh' && p.id !== undefined) {
+          ensureRemoteTemplatePlaceholder(p);
+          fetchAndAddCloudTemplate(p.id);
         } else if (ev === 'template_update') {
           const tpl = templates.find(t => String(t.id) === String(p.id));
           if (tpl && p.updates) {
             const needIndices = (p.updates.confirmed && !tpl.confirmed) || (!tpl.rawIndices && (tpl.confirmed || p.updates.confirmed));
-            Object.assign(tpl, p.updates);
+            const sharedUpdates = { ...p.updates };
+            delete sharedUpdates.filterCI;
+            delete sharedUpdates.filterActive;
+            Object.assign(tpl, sharedUpdates);
             if (needIndices) {
               tpl.confirmed = true;
               const setupCanvas = (img) => {
@@ -186,7 +267,8 @@ function connectSupabaseRealtime() {
                 const { canvas, rawIndices } = buildPaletteCanvas(img, W, H);
                 tpl.canvas = canvas; tpl.rawIndices = rawIndices;
                 tpl.stitchCanvas = makeStitchCanvas(rawIndices, tpl.w, tpl.h);
-                if (tpl.filterCI >= 0) tpl.filterCanvas = makeFilterStitchCanvas(rawIndices, tpl.w, tpl.h, tpl.filterCI);
+                tpl.filterCanvasCache = null;
+                applyLocalTemplateFilter(tpl);
                 markDirty();
               };
               if (tpl.origImage && (tpl.origImage.complete || tpl.origImage.naturalWidth)) {
@@ -202,6 +284,8 @@ function connectSupabaseRealtime() {
             markDirty();
           }
         } else if (ev === 'template_delete') {
+          if (String(activePaintingTemplateId) === String(p.id)) exitTemplatePainting(false);
+          removeLocalTemplateFilter(p.id);
           templates = templates.filter(t => String(t.id) !== String(p.id));
           renderTemplateList();
           markDirty();
@@ -277,7 +361,8 @@ function flushWSLines() {
 
 function queueWSPixel(x, y, ci) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  wsBatch.push({ x, y, c: ci });
+  // Flat numeric batches avoid allocating one object for every painted pixel.
+  wsBatch.push(x, y, ci);
   if (!wsFlushTimer) {
     wsFlushTimer = setTimeout(flushWSPixels, 20);
   }
@@ -288,23 +373,16 @@ function flushWSPixels() {
   if (!wsBatch.length) return;
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      if (wsBatch.length === 1) {
+      if (wsBatch.length === 3) {
         ws.send(JSON.stringify({
           topic: 'realtime:bplace',
           event: 'broadcast',
-          payload: { type: 'broadcast', event: 'pixel', payload: wsBatch[0] },
+          payload: { type: 'broadcast', event: 'pixel', payload: { x: wsBatch[0], y: wsBatch[1], c: wsBatch[2] } },
           ref: String(sbMsgRef++)
         }));
       } else {
-        const flat = new Array(wsBatch.length * 3);
-        for (let i = 0; i < wsBatch.length; i++) {
-          const idx = i * 3;
-          flat[idx] = wsBatch[i].x;
-          flat[idx + 1] = wsBatch[i].y;
-          flat[idx + 2] = wsBatch[i].c;
-        }
-        for (let i = 0; i < flat.length; i += 6000) {
-          const chunk = flat.slice(i, i + 6000);
+        for (let i = 0; i < wsBatch.length; i += 6000) {
+          const chunk = wsBatch.slice(i, i + 6000);
           ws.send(JSON.stringify({
             topic: 'realtime:bplace',
             event: 'broadcast',
@@ -346,8 +424,8 @@ async function addTemplateFromData(saved, list = templates) {
       opacity: saved.opacity ?? 0.8,
       visible: saved.visible !== false,
       confirmed: !!saved.confirmed,
-      filterActive: saved.filterCI >= 0,
-      filterCI: saved.filterCI ?? -1,
+      filterActive: false,
+      filterCI: -1,
       filterCanvas: null,
       canvas: null,
       rawIndices: null,
@@ -360,9 +438,7 @@ async function addTemplateFromData(saved, list = templates) {
       tpl.canvas = canvas;
       tpl.rawIndices = rawIndices;
       tpl.stitchCanvas = makeStitchCanvas(rawIndices, W, H);
-      if (tpl.filterCI >= 0) {
-        tpl.filterCanvas = makeFilterStitchCanvas(rawIndices, W, H, tpl.filterCI);
-      }
+      applyLocalTemplateFilter(tpl);
     }
     list.push(tpl);
   } catch (e) {
@@ -371,6 +447,7 @@ async function addTemplateFromData(saved, list = templates) {
 }
 
 function sendTemplateUpdate(tpl) {
+  if (!tpl || tpl.draft) return;
   const updates = {
     x: tpl.x,
     y: tpl.y,
@@ -378,8 +455,7 @@ function sendTemplateUpdate(tpl) {
     h: tpl.h,
     opacity: tpl.opacity,
     visible: tpl.visible,
-    confirmed: tpl.confirmed,
-    filterCI: tpl.filterCI
+    confirmed: tpl.confirmed
   };
 
   // 1. Broadcast to all clients over Supabase Realtime
@@ -418,8 +494,7 @@ function debounceTemplateRestUpdate(tpl) {
         h: tpl.h,
         opacity: tpl.opacity,
         visible: tpl.visible,
-        confirmed: tpl.confirmed,
-        filter_ci: tpl.filterCI
+        confirmed: tpl.confirmed
       })
     }).catch(() => {});
   }, 400);
@@ -429,10 +504,17 @@ function deleteTemplate(tplId) {
   if (activeAdjustingTpl && activeAdjustingTpl.id === tplId) {
     closeTemplateAdjustment();
   }
+  const templateToDelete = templates.find(t => t.id === tplId);
+  const wasDraft = !!(templateToDelete && templateToDelete.draft);
+  if (activePaintingTemplateId === tplId) exitTemplatePainting(false);
+  removeLocalTemplateFilter(tplId);
   templates = templates.filter(t => t.id !== tplId);
   renderTemplateList();
   markDirty();
   saveTemplatesToIDB();
+
+  // A draft only exists on this device until the user confirms it.
+  if (wasDraft) return;
 
   // 1. Broadcast to all clients over Supabase Realtime
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -484,8 +566,7 @@ async function loadTemplatesFromCloud() {
             h: t.h,
             opacity: t.opacity,
             visible: t.visible,
-            confirmed: t.confirmed,
-            filterCI: t.filter_ci
+            confirmed: t.confirmed
           }, loadedList);
         }
         templates = loadedList;
@@ -611,6 +692,7 @@ let isLightThemeCached = false;
 let coordDisplayEl = null, zoomDisplayEl = null, pxCursorEl = null;
 let lastCoordX = -999, lastCoordY = -999;
 let cachedCanvasRect = null;
+let offscreenFillCI = -1;
 
 let vx = 0, vy = 0, vz = 1;
 let panning = false, panX = 0, panY = 0;
@@ -629,12 +711,19 @@ let recentColors    = [];
 let favColors       = [];
 
 let templates   = [];
+let activePaintingTemplateId = null;
+let localTemplateFilters = (() => {
+  try { return JSON.parse(localStorage.getItem('bplace_template_filters') || '{}'); }
+  catch (_) { return {}; }
+})();
 let exportScale = 1;
 let idbSaveTmr  = null;
 let idb         = null;
 let dirty = false, rafId = null;
 let tplSaveTmr  = null;
 let paintModeActive = false; // When false, canvas is navigation-only (no drawing)
+let canvasPersistenceDirty = false;
+const MAX_DETAILED_TEMPLATE_CELLS = IS_COARSE_POINTER ? 45000 : 120000;
 
 /* Resize state */
 let resizeTpl    = null;
@@ -651,6 +740,11 @@ const ghostCanvas = $('ghost-canvas');
 const ctx         = mainCanvas.getContext('2d');
 const ghostCtx    = ghostCanvas.getContext('2d');
 const wrap        = $('canvas-wrap');
+
+function getCanvasRect(refresh = false) {
+  if (refresh || !cachedCanvasRect) cachedCanvasRect = mainCanvas.getBoundingClientRect();
+  return cachedCanvasRect;
+}
 
 /* === Pixel Sound SFX (Max 5/sec) === */
 let audioCtx = null;
@@ -879,11 +973,38 @@ function idbLoad() {
   });
 }
 function scheduleIDBSave() {
-  clearTimeout(idbSaveTmr);
-  idbSaveTmr = setTimeout(() => { if (canvasData) idbSave(canvasData); }, 4000);
+  canvasPersistenceDirty = true;
+  if (idbSaveTmr) return;
+  idbSaveTmr = setTimeout(() => {
+    idbSaveTmr = null;
+    if (canvasData && canvasPersistenceDirty) {
+      canvasPersistenceDirty = false;
+      idbSave(canvasData);
+    }
+  }, 2500);
 }
 
 /* === Template Persistence === */
+function saveLocalTemplateFilter(tpl) {
+  if (!tpl) return;
+  if (tpl.filterActive && tpl.filterCI >= 0) localTemplateFilters[String(tpl.id)] = tpl.filterCI;
+  else delete localTemplateFilters[String(tpl.id)];
+  try { localStorage.setItem('bplace_template_filters', JSON.stringify(localTemplateFilters)); } catch (_) {}
+}
+
+function removeLocalTemplateFilter(tplId) {
+  delete localTemplateFilters[String(tplId)];
+  try { localStorage.setItem('bplace_template_filters', JSON.stringify(localTemplateFilters)); } catch (_) {}
+}
+
+function applyLocalTemplateFilter(tpl) {
+  if (!tpl) return;
+  const savedCI = Number(localTemplateFilters[String(tpl.id)]);
+  tpl.filterActive = Number.isInteger(savedCI) && savedCI >= 0 && savedCI < paletteHex.length;
+  tpl.filterCI = tpl.filterActive ? savedCI : -1;
+  tpl.filterCanvas = tpl.filterActive && tpl.rawIndices ? getTemplateFilterCanvas(tpl, savedCI) : null;
+}
+
 function scheduleTemplateSave() {
   clearTimeout(tplSaveTmr);
   tplSaveTmr = setTimeout(saveTemplatesToIDB, 1500);
@@ -891,7 +1012,7 @@ function scheduleTemplateSave() {
 
 async function saveTemplatesToIDB() {
   if (!idb) return;
-  const list = templates.map(tpl => ({
+  const list = templates.filter(tpl => !tpl.draft).map(tpl => ({
     id:            tpl.id,
     name:          tpl.name,
     origImageURL:  tpl.origImageURL,
@@ -902,9 +1023,10 @@ async function saveTemplatesToIDB() {
     opacity:       tpl.opacity,
     visible:       tpl.visible,
     confirmed:     tpl.confirmed,
-    filterCI:      tpl.filterCI,
     // store rawIndices as plain array (IDB-safe serialization)
-    rawIndices:    tpl.rawIndices ? Array.from(tpl.rawIndices) : null,
+    // IndexedDB clones typed arrays natively; converting to Array creates a
+    // much larger temporary allocation for every template save.
+    rawIndices:    tpl.rawIndices || null,
   }));
   const tx = idb.transaction(DB_TPL, 'readwrite');
   tx.objectStore(DB_TPL).put(list, 'list');
@@ -937,7 +1059,7 @@ async function restoreTemplatesFromIDB() {
         x: saved.x, y: saved.y, w: saved.w, h: saved.h,
         opacity: saved.opacity, visible: saved.visible,
         confirmed: saved.confirmed,
-        filterActive: false, filterCI: saved.filterCI || -1, filterCanvas: null,
+        filterActive: false, filterCI: -1, filterCanvas: null,
         canvas: null, rawIndices: null, stitchCanvas: null,
       };
       if (saved.confirmed && saved.rawIndices) {
@@ -945,6 +1067,7 @@ async function restoreTemplatesFromIDB() {
         tpl.canvas     = buildCanvasFromRawIndices(tpl.rawIndices, saved.w, saved.h);
         tpl.stitchCanvas = makeStitchCanvas(tpl.rawIndices, saved.w, saved.h);
       }
+      applyLocalTemplateFilter(tpl);
       templates.push(tpl);
     } catch(e) { console.warn('Could not restore template', saved.name, e); }
   }
@@ -981,9 +1104,15 @@ function buildCanvasFromData(data) {
 }
 function setPixelPalette(x, y, ci) {
   if (ci < 0 || ci >= palRGB.length) return;
-  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  setOffscreenPaletteColor(ci);
   offCtx.fillRect(x, y, 1, 1);
   if (canvasData) canvasData[y * CS + x] = ci;
+}
+
+function setOffscreenPaletteColor(ci) {
+  if (offscreenFillCI === ci) return;
+  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  offscreenFillCI = ci;
 }
 /* 15-bit High-Speed Color Quantization Cache (32,768 entries = 64KB RAM) */
 const rgb15Cache = new Int16Array(32768).fill(-1);
@@ -1013,6 +1142,43 @@ function nearestPaletteIndex(hex) {
 function markDirty() { dirty = true; if (!rafId) rafId = requestAnimationFrame(loop); }
 function loop()      { rafId = null; if (dirty) { dirty = false; render(); } }
 
+function drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH) {
+  const tx = Math.round((ox - vx) * vz), ty = Math.round((oy - vy) * vz);
+  const tw = Math.round(tplW * vz), th = Math.round(tplH * vz);
+  const bitmap = tpl.filterActive && tpl.filterCanvas ? tpl.filterCanvas : tpl.canvas;
+  if (!bitmap) return;
+
+  ctx.drawImage(bitmap, tx, ty, tw, th);
+
+  // Preserve the visual language of an unpainted template at every zoom:
+  // white space separates every guide cell instead of showing a solid image.
+  const startPX = Math.max(0, Math.floor(vx - ox));
+  const endPX = Math.min(tplW, Math.ceil(vx + srcW - ox));
+  const startPY = Math.max(0, Math.floor(vy - oy));
+  const endPY = Math.min(tplH, Math.ceil(vy + srcH - oy));
+  if (startPX >= endPX || startPY >= endPY) return;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(tx, ty, tw, th);
+  ctx.clip();
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = Math.max(0.35, vz * 0.44);
+  ctx.beginPath();
+  for (let px = startPX; px <= endPX; px++) {
+    const sx = (ox + px - vx) * vz;
+    ctx.moveTo(sx, ty);
+    ctx.lineTo(sx, ty + th);
+  }
+  for (let py = startPY; py <= endPY; py++) {
+    const sy = (oy + py - vy) * vz;
+    ctx.moveTo(tx, sy);
+    ctx.lineTo(tx + tw, sy);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
 /* === Template canvas builders & Guide Renderer === */
 function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
   if (!tpl.rawIndices) return;
@@ -1029,6 +1195,17 @@ function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
     const endPY   = Math.min(tplH, Math.ceil(vy + srcH - oy));
 
     if (startPX >= endPX || startPY >= endPY) return;
+
+    // A dense guide can contain hundreds of thousands of visible cells.
+    // Use the cached bitmap until zoom is close enough for individual guide
+    // dots to be useful, then switch back automatically.
+    if ((endPX - startPX) * (endPY - startPY) > MAX_DETAILED_TEMPLATE_CELLS) {
+      drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH);
+      return;
+    }
+
+    const whitePath = new Path2D();
+    const colorPaths = new Array(palRGB.length);
 
     for (let py = startPY; py < endPY; py++) {
       const cy = oy + py;
@@ -1058,9 +1235,9 @@ function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
         const ph = ey - sy;
         if (pw <= 0 || ph <= 0) continue;
 
-        // 1. Draw white background/border for template guide pixel
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(sx, sy, pw, ph);
+        // Build paths first, then paint them in at most 65 draw calls instead
+        // of changing fill color and drawing twice for every visible pixel.
+        whitePath.rect(sx, sy, pw, ph);
 
         // 2. Draw centered colored dot with white border
         const marginX = Math.max(1, Math.round(pw * 0.22));
@@ -1069,20 +1246,22 @@ function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
         const dotH = ph - marginY * 2;
 
         if (dotW > 0 && dotH > 0) {
-          ctx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
-          ctx.fillRect(sx + marginX, sy + marginY, dotW, dotH);
+          let colorPath = colorPaths[ci];
+          if (!colorPath) colorPath = colorPaths[ci] = new Path2D();
+          colorPath.rect(sx + marginX, sy + marginY, dotW, dotH);
         }
       }
     }
-  } else {
-    // Zoomed out (vz < 3): blit precomputed canvas directly
-    const tx = Math.round((ox - vx) * vz), ty = Math.round((oy - vy) * vz);
-    const tw = Math.round(tplW * vz),      th = Math.round(tplH * vz);
-    if (tpl.filterActive && tpl.filterCanvas) {
-      ctx.drawImage(tpl.filterCanvas, tx, ty, tw, th);
-    } else if (tpl.canvas) {
-      ctx.drawImage(tpl.canvas, tx, ty, tw, th);
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill(whitePath);
+    for (let ci = 0; ci < colorPaths.length; ci++) {
+      if (!colorPaths[ci]) continue;
+      ctx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+      ctx.fill(colorPaths[ci]);
     }
+  } else {
+    drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH);
   }
 }
 
@@ -1101,6 +1280,21 @@ function makeFilterStitchCanvas(rawIndices, W, H, targetCI) {
   }
   tctx.putImageData(img, 0, 0);
   return tmp;
+}
+
+function getTemplateFilterCanvas(tpl, targetCI) {
+  if (!tpl || !tpl.rawIndices || targetCI < 0) return null;
+  if (!tpl.filterCanvasCache) tpl.filterCanvasCache = new Map();
+  if (tpl.filterCanvasCache.has(targetCI)) return tpl.filterCanvasCache.get(targetCI);
+  const filtered = makeFilterStitchCanvas(tpl.rawIndices, Math.round(tpl.w), Math.round(tpl.h), targetCI);
+  // Keep a small LRU-style cache: enough for quick color switching without
+  // retaining dozens of full template canvases on memory-limited phones.
+  if (tpl.filterCanvasCache.size >= 3) {
+    const oldest = tpl.filterCanvasCache.keys().next().value;
+    tpl.filterCanvasCache.delete(oldest);
+  }
+  tpl.filterCanvasCache.set(targetCI, filtered);
+  return filtered;
 }
 
 function buildPaletteCanvas(origImage, W, H) {
@@ -1175,7 +1369,7 @@ function applyStampTemplate(tpl, startX, startY, filterCI) {
   }
   for (const ci in buckets) {
     const coords = buckets[ci];
-    offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+    setOffscreenPaletteColor(Number(ci));
     for (let k = 0; k < coords.length; k += 2) {
       offCtx.fillRect(coords[k], coords[k + 1], 1, 1);
     }
@@ -1245,20 +1439,35 @@ function stampTemplate(tpl) {
 }
 
 function confirmTemplate(tpl) {
+  if (!tpl || tpl.confirming) return;
   const W = Math.max(10, Math.round(tpl.w));
   const H = Math.max(10, Math.round(tpl.h));
+  tpl.confirming = true;
   showToast('Procesando plantilla...', '');
   setTimeout(() => {
-    const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, W, H);
-    tpl.canvas = canvas; tpl.rawIndices = rawIndices;
-    tpl.w = W; tpl.h = H;
-    tpl.stitchCanvas = makeStitchCanvas(rawIndices, W, H);
-    tpl.confirmed = true; tpl.filterActive = false; tpl.filterCI = -1; tpl.filterCanvas = null;
-    closeTemplateAdjustment();
-    renderTemplateList(); markDirty();
-    scheduleTemplateSave();
-    sendTemplateUpdate(tpl); // Sync with other clients!
-    showToast('Plantilla confirmada como guía!', 'success');
+    try {
+      const { canvas, rawIndices } = buildPaletteCanvas(tpl.origImage, W, H);
+      tpl.canvas = canvas; tpl.rawIndices = rawIndices;
+      tpl.w = W; tpl.h = H;
+      tpl.stitchCanvas = makeStitchCanvas(rawIndices, W, H);
+      tpl.filterCanvasCache = null;
+      tpl.confirmed = true; tpl.filterActive = false; tpl.filterCI = -1; tpl.filterCanvas = null;
+      removeLocalTemplateFilter(tpl.id);
+      const wasDraft = !!tpl.draft;
+      tpl.draft = false;
+      tpl.confirming = false;
+      closeTemplateAdjustment();
+      renderTemplateList(); markDirty();
+      saveTemplatesToIDB();
+      if (wasDraft) publishTemplate(tpl);
+      else sendTemplateUpdate(tpl);
+      showToast('Plantilla confirmada como guía', 'success');
+      selectTemplateForPainting(tpl);
+    } catch (error) {
+      tpl.confirming = false;
+      console.error('No se pudo procesar la plantilla:', error);
+      showToast('No se pudo procesar esta imagen', 'error');
+    }
   }, 50);
 }
 
@@ -1273,7 +1482,7 @@ function getHandlePositions(tx, ty, tw, th) {
 }
 const HANDLE_CURSORS = {tl:'nw-resize',tc:'n-resize',tr:'ne-resize',ml:'w-resize',mr:'e-resize',bl:'sw-resize',bc:'s-resize',br:'se-resize'};
 function hitTestHandles(sx, sy) {
-  const R = 9;
+  const R = IS_COARSE_POINTER ? 18 : 10;
   for (let i = templates.length-1; i >= 0; i--) {
     const tpl = templates[i];
     if (tpl.confirmed || !tpl.visible) continue;
@@ -1292,8 +1501,9 @@ function render() {
   const W = mainCanvas.width, H = mainCanvas.height;
   if (!W || !H) return;
 
-  const isLight = isLightThemeCached;
-  ctx.fillStyle = isLight ? '#eef2f6' : '#181825';
+  // Keep the workspace visually continuous with the white 3000×3000 canvas.
+  // Areas outside its bounds stay white at every zoom level.
+  ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, W, H);
   ctx.imageSmoothingEnabled = false;
   const srcW = W / vz, srcH = H / vz;
@@ -1303,10 +1513,6 @@ function render() {
     ctx.drawImage(offscreen, sx, sy, ex - sx, ey - sy, (sx - vx) * vz, (sy - vy) * vz, (ex - sx) * vz, (ey - sy) * vz);
   }
 
-  const bx = Math.round(-vx * vz) + .5, by = Math.round(-vy * vz) + .5;
-  ctx.strokeStyle = isLight ? 'rgba(99, 102, 241, 0.4)' : 'rgba(129, 140, 248, 0.5)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(bx, by, CS * vz, CS * vz);
   if (vz >= 7) drawGrid(W, H, srcW, srcH);
 
   const tplCount = templates.length;
@@ -1435,10 +1641,12 @@ function setCurrentColor(hex,addToRecent){
     if(tpl.confirmed&&tpl.filterActive){
       const ci=nearestPaletteIndex(hex);
       tpl.filterCI=ci;
-      tpl.filterCanvas=makeFilterStitchCanvas(tpl.rawIndices,tpl.w,tpl.h,ci);
+      tpl.filterCanvas=getTemplateFilterCanvas(tpl,ci);
+      saveLocalTemplateFilter(tpl);
       markDirty();
     }
   });
+  updateTemplateContextToolbar();
   if (!paintModeActive) {
     activatePaintMode(tool || 'brush');
   }
@@ -1555,8 +1763,7 @@ function executeFloodFill(sx, sy, ni) {
   if (oi === ni) return;
 
   const stack = [idx0];
-  const colorStr = palRGBStrings[ni] || paletteHex[ni];
-  offCtx.fillStyle = colorStr;
+  setOffscreenPaletteColor(ni);
 
   while (stack.length > 0) {
     const idx = stack.pop();
@@ -1631,7 +1838,7 @@ function paintBrush(cx, cy, ci) {
   const h = maxY - minY + 1;
   if (w <= 0 || h <= 0) return;
 
-  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  setOffscreenPaletteColor(ci);
   offCtx.fillRect(minX, minY, w, h);
   if (canvasData) {
     for (let py = minY; py <= maxY; py++) {
@@ -1649,7 +1856,7 @@ function paintRect(x0, y0, x1, y1, ci, f) {
   const h = by - ty + 1;
   if (w <= 0 || h <= 0) return;
 
-  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  setOffscreenPaletteColor(ci);
   if (f) {
     offCtx.fillRect(lx, ty, w, h);
     if (canvasData) {
@@ -1678,7 +1885,7 @@ function paintRect(x0, y0, x1, y1, ci, f) {
 
 function paintEllipse(cx, cy, a, b, ci, f) {
   a = Math.max(0, a); b = Math.max(0, b);
-  offCtx.fillStyle = palRGBStrings[ci] || paletteHex[ci];
+  setOffscreenPaletteColor(ci);
   if (f) {
     for (let dy = -b; dy <= b; dy++) {
       const py = cy + dy;
@@ -1701,7 +1908,10 @@ function paintEllipse(cx, cy, a, b, ci, f) {
     };
     let x = 0, y = b, d1 = (b * b) - (a * a * b) + 0.25 * a * a, ddx = 0, ddy = 2 * a * a * b;
     const p4 = (px, py) => {
-      [[cx + px, cy + py], [cx - px, cy + py], [cx + px, cy - py], [cx - px, cy - py]].forEach(([ex, ey]) => drawPixel(ex, ey));
+      drawPixel(cx + px, cy + py);
+      drawPixel(cx - px, cy + py);
+      drawPixel(cx + px, cy - py);
+      drawPixel(cx - px, cy - py);
     };
     while (ddx < ddy) {
       p4(x, y);
@@ -1765,7 +1975,7 @@ function commitShape(x0, y0, x1, y1) {
 /* === Canvas draw event handlers === */
 function onMouseDown(e){
   e.preventDefault();
-  const rect=mainCanvas.getBoundingClientRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
+  const rect=getCanvasRect(true),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
   if(e.button===1||e.button===2){panning=true;panX=e.clientX;panY=e.clientY;wrap.classList.add('panning');return;}
   if(e.button!==0)return;
   /* If not in paint mode, treat left click as pan */
@@ -1784,7 +1994,7 @@ function onMouseDown(e){
   else paintPixelMain(x,y);
 }
 function onMouseMove(e){
-  const rect=mainCanvas.getBoundingClientRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
+  const rect=getCanvasRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
   updateHover(sx,sy);
   if(panning){vx-=(e.clientX-panX)/vz;vy-=(e.clientY-panY)/vz;panX=e.clientX;panY=e.clientY;markDirty();return;}
   if(shapeStart&&e.buttons===1){renderGhost(shapeStart.x,shapeStart.y,x,y);return;}
@@ -1821,11 +2031,17 @@ function onMouseMove(e){
 }
 function onMouseUp(e){
   if(panning){panning=false;wrap.classList.remove('panning');return;}
-  if(shapeStart&&e.button===0){const rect=mainCanvas.getBoundingClientRect(),{x,y}=s2c(e.clientX-rect.left,e.clientY-rect.top);clearGhost();commitShape(shapeStart.x,shapeStart.y,x,y);shapeStart=null;return;}
+  if(shapeStart&&e.button===0){const rect=getCanvasRect(),{x,y}=s2c(e.clientX-rect.left,e.clientY-rect.top);clearGhost();commitShape(shapeStart.x,shapeStart.y,x,y);shapeStart=null;return;}
   if(drawing){drawing=false;drawLX=-1;drawLY=-1;scheduleIDBSave();flushWSPixels();flushWSLines();}
 }
 function onMouseLeave(){$('px-cursor').classList.add('hidden');$('coord-display').textContent='- , -';mainCanvas.style.cursor='';drawing=false;if(panning){panning=false;wrap.classList.remove('panning');}}
-function onWheel(e){e.preventDefault();const r=mainCanvas.getBoundingClientRect();doZoom(e.deltaY<0?1.15:1/1.15,e.clientX-r.left,e.clientY-r.top);}
+function onWheel(e){
+  e.preventDefault();
+  const r=getCanvasRect();
+  const unit=e.deltaMode===1?16:e.deltaMode===2?mainCanvas.height:1;
+  const delta=clamp(e.deltaY*unit,-240,240);
+  doZoom(Math.exp(-delta*0.0014),e.clientX-r.left,e.clientY-r.top);
+}
 function onKeyDown(e){const tag=e.target.tagName;if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT')return;switch(e.key.toLowerCase()){case 'b':activatePaintMode('brush');break;case 'e':activatePaintMode('erase');break;case 'i':if(paintModeActive)setTool('eye');break;case 'l':if(paintModeActive)setTool('line');break;case 'r':if(paintModeActive)setTool('rect');break;case 'c':if(paintModeActive)setTool('circle');break;case 'f':fitCanvas();break;case 'x':swapColors();break;case '+':case '=':doZoom(1.25,mainCanvas.width/2,mainCanvas.height/2);break;case '-':doZoom(.8,mainCanvas.width/2,mainCanvas.height/2);break;case '[':setBrushSize(Math.max(1,brushSize-1));break;case ']':setBrushSize(Math.min(32,brushSize+1));break;case 'escape':if(paintModeActive)deactivatePaintMode();break;case ' ':if(!e.repeat){spaceHeld=true;spLX=-1;spLY=-1;}e.preventDefault();break;}}
 function onKeyUp(e){if(e.key===' '){spaceHeld=false;spLX=-1;spLY=-1;}}
 
@@ -1891,7 +2107,7 @@ function toggleMobileSidebar(force) {
 }
 
 /* === Window resize === */
-function resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(mainCanvas.width!==w||mainCanvas.height!==h){mainCanvas.width=w;mainCanvas.height=h;ghostCanvas.width=w;ghostCanvas.height=h;markDirty();}}
+function resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(mainCanvas.width!==w||mainCanvas.height!==h){mainCanvas.width=w;mainCanvas.height=h;ghostCanvas.width=w;ghostCanvas.height=h;cachedCanvasRect=null;markDirty();}}
 function setBrushSize(s) {
   brushSize = clamp(s, 1, 32);
   playSelectSound();
@@ -1903,9 +2119,15 @@ function setBrushSize(s) {
 
 /* === Compact Top Template Adjustment Card State & Controller === */
 let activeAdjustingTpl = null;
+let adjustCardDimRaf = null;
+let pendingAdjustingTpl = null;
 
 function openTemplateAdjustment(tpl) {
   if (!tpl) return;
+  document.body.classList.remove('template-library-open', 'template-painting');
+  activePaintingTemplateId = null;
+  const contextToolbar = $('tpl-context-toolbar');
+  if (contextToolbar) contextToolbar.classList.add('hidden');
   activeAdjustingTpl = tpl;
   const nameEl = $('tac-filename');
   const dimEl = $('tac-dimensions');
@@ -1939,10 +2161,17 @@ function closeTemplateAdjustment() {
 
 function updateAdjustCardDimensions(tpl) {
   if (!tpl) return;
-  if (activeAdjustingTpl && activeAdjustingTpl.id === tpl.id) {
+  pendingAdjustingTpl = tpl;
+  if (adjustCardDimRaf) return;
+  adjustCardDimRaf = requestAnimationFrame(() => {
+    adjustCardDimRaf = null;
+    const current = pendingAdjustingTpl;
+    pendingAdjustingTpl = null;
+    if (!current || !activeAdjustingTpl || activeAdjustingTpl.id !== current.id) return;
     const dimEl = $('tac-dimensions');
-    if (dimEl) dimEl.textContent = Math.round(tpl.w) + ' × ' + Math.round(tpl.h) + ' píxeles';
-  }
+    const text = Math.round(current.w) + ' × ' + Math.round(current.h) + ' píxeles';
+    if (dimEl && dimEl.textContent !== text) dimEl.textContent = text;
+  });
 }
 
 /* === Template panel toggle (slide, not hide) === */
@@ -1965,6 +2194,10 @@ function updatePanelTabIcon(){
 /* === Template file loading (FileReader for persistence) === */
 function loadTemplateFile(file) {
   if (templates.length >= MAX_TPLS) { showToast('Máximo ' + MAX_TPLS + ' plantillas', 'error'); return; }
+  if (!file || !file.type || !file.type.startsWith('image/')) {
+    showToast('Selecciona una imagen válida', 'error');
+    return;
+  }
   const reader = new FileReader();
   reader.onload = e => {
     const dataURL = e.target.result;
@@ -1997,73 +2230,160 @@ function loadTemplateFile(file) {
         canvas: null, rawIndices: null, stitchCanvas: null,
         filterActive: false, filterCI: -1, filterCanvas: null,
         x: initX, y: initY, w: initW, h: initH,
-        opacity: 0.85, visible: true, confirmed: false,
+        opacity: 0.85, visible: true, confirmed: false, draft: true,
+        aspectRatio: (img.naturalWidth || initW) / (img.naturalHeight || initH),
       };
       templates.push(tpl);
       renderTemplateList();
       markDirty();
-      saveTemplatesToIDB();
 
-      // Open compact top floating adjustment card (hiding paint tools & big panel)
+      // Keep this template local and provisional until the user confirms it.
       openTemplateAdjustment(tpl);
-
-      const payloadTpl = {
-        id: tpl.id,
-        name: tpl.name,
-        origImageURL: tpl.origImageURL,
-        x: tpl.x,
-        y: tpl.y,
-        w: tpl.w,
-        h: tpl.h,
-        opacity: tpl.opacity,
-        visible: tpl.visible,
-        confirmed: tpl.confirmed,
-        filterCI: tpl.filterCI
-      };
-
-      // 1. Broadcast addition to all devices over Supabase Realtime
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          topic: 'realtime:bplace',
-          event: 'broadcast',
-          payload: {
-            type: 'broadcast',
-            event: 'template_add',
-            payload: { template: payloadTpl }
-          },
-          ref: String(sbMsgRef++)
-        }));
-      }
-
-      // 2. Persist to Supabase PostgreSQL table
-      fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates`, {
-        method: 'POST',
-        headers: {
-          'apikey': SUPABASE_CONFIG.anonKey,
-          'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates'
-        },
-        body: JSON.stringify({
-          id: tpl.id,
-          name: tpl.name,
-          orig_image_url: tpl.origImageURL,
-          x: tpl.x,
-          y: tpl.y,
-          w: tpl.w,
-          h: tpl.h,
-          opacity: tpl.opacity,
-          visible: tpl.visible,
-          confirmed: tpl.confirmed,
-          filter_ci: tpl.filterCI
-        })
-      }).catch(err => console.warn('[Supabase] Error saving template:', err));
-
-      showToast('Plantilla cargada y sincronizada en la nube', 'success');
+      showToast('Mueve y ajusta la imagen; confirma con ✓', 'success');
     };
     img.src = dataURL;
   };
   reader.readAsDataURL(file);
+}
+
+function getActivePaintingTemplate() {
+  return templates.find(tpl => tpl.id === activePaintingTemplateId && tpl.confirmed) || null;
+}
+
+function updateTemplateLibraryCount() {
+  const count = templates.length;
+  const badge = $('tpl-count-badge');
+  if (badge) {
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.classList.toggle('hidden', count === 0);
+  }
+  const subtitle = $('tpl-library-subtitle');
+  if (subtitle) subtitle.textContent = count ? count + (count === 1 ? ' plantilla importada' : ' plantillas importadas') : 'Administra tus plantillas';
+}
+
+function updateTemplateContextToolbar() {
+  const tpl = getActivePaintingTemplate();
+  const bar = $('tpl-context-toolbar');
+  if (!bar) return;
+  bar.classList.toggle('hidden', !tpl);
+  document.body.classList.toggle('template-painting', !!tpl);
+  if (!tpl) return;
+  const name = $('tpl-context-name');
+  if (name) name.textContent = tpl.name || 'Plantilla';
+  const filter = $('tpl-context-filter');
+  if (filter) {
+    filter.classList.toggle('active', !!tpl.filterActive);
+    filter.setAttribute('aria-pressed', String(!!tpl.filterActive));
+  }
+  const swatch = $('tpl-context-filter-swatch');
+  if (swatch) swatch.style.backgroundColor = paletteHex[tpl.filterCI >= 0 ? tpl.filterCI : currentPaletteCI] || currentColorHex;
+  updateCanvasLockUI();
+}
+
+function openTemplateLibrary() {
+  closeTemplateAdjustment();
+  activePaintingTemplateId = null;
+  document.body.classList.remove('template-painting');
+  document.body.classList.add('template-library-open');
+  const bar = $('tpl-context-toolbar');
+  if (bar) bar.classList.add('hidden');
+  const panel = $('tpl-panel');
+  if (panel) panel.classList.remove('hidden', 'collapsed');
+  deactivatePaintMode();
+  renderTemplateList();
+}
+
+function closeTemplateLibrary() {
+  document.body.classList.remove('template-library-open');
+  const panel = $('tpl-panel');
+  if (panel) panel.classList.add('hidden');
+}
+
+function selectTemplateForPainting(tpl) {
+  if (!tpl || !tpl.confirmed) return;
+  if (tpl.remoteLoading) { showToast('La plantilla todavía se está descargando', ''); return; }
+  tpl.visible = true;
+  activePaintingTemplateId = tpl.id;
+  closeTemplateLibrary();
+  activatePaintMode(tool || 'brush');
+  updateTemplateContextToolbar();
+  renderTemplateList();
+  markDirty();
+  scheduleTemplateSave();
+  sendTemplateUpdate(tpl);
+}
+
+function exitTemplatePainting(openLibrary = true) {
+  activePaintingTemplateId = null;
+  document.body.classList.remove('template-painting');
+  const bar = $('tpl-context-toolbar');
+  if (bar) bar.classList.add('hidden');
+  if (openLibrary) openTemplateLibrary();
+}
+
+function toggleTemplateFilter(tpl) {
+  if (!tpl || !tpl.confirmed) return;
+  tpl.filterActive = !tpl.filterActive;
+  if (tpl.filterActive) {
+    const ci = nearestPaletteIndex(currentColorHex);
+    tpl.filterCI = ci;
+    tpl.filterCanvas = getTemplateFilterCanvas(tpl, ci);
+    showToast('Filtro: ' + paletteHex[ci].toUpperCase(), '');
+  } else {
+    tpl.filterCI = -1;
+    tpl.filterCanvas = null;
+    showToast('Filtro desactivado', '');
+  }
+  renderTemplateList();
+  updateTemplateContextToolbar();
+  markDirty();
+  saveLocalTemplateFilter(tpl);
+}
+
+function updateCanvasLockUI() {
+  const lockedPath = '<path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="3" y="11" width="18" height="11" rx="2"/>';
+  const unlockedPath = '<path d="M7 11V7a5 5 0 0 1 9.9-1"/><rect x="3" y="11" width="18" height="11" rx="2"/>';
+  [$('lock-icon'), $('tpl-context-lock-icon')].forEach(icon => { if (icon) icon.innerHTML = canvasLocked ? lockedPath : unlockedPath; });
+  [$('btn-lock'), $('tpl-context-lock')].forEach(btn => {
+    if (!btn) return;
+    btn.classList.toggle('active', canvasLocked);
+    btn.setAttribute('aria-pressed', String(canvasLocked));
+  });
+}
+
+function setCanvasLocked(locked, notify = true) {
+  canvasLocked = !!locked;
+  updateCanvasLockUI();
+  if (notify) showToast(canvasLocked ? 'Lienzo bloqueado: Desliza para pintar' : 'Lienzo libre: Desliza para mover, toca para pintar', 'success');
+}
+
+async function publishTemplate(tpl) {
+  // A Base64 image can be several MB and exceed the realtime message limit.
+  // Broadcast only the id; every device downloads the persisted row by HTTP.
+  announceTemplateRefresh(tpl);
+  try {
+    const res = await fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_CONFIG.anonKey,
+        'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      body: JSON.stringify({
+        id: tpl.id, name: tpl.name, orig_image_url: tpl.origImageURL,
+        x: tpl.x, y: tpl.y, w: tpl.w, h: tpl.h,
+        opacity: tpl.opacity, visible: tpl.visible,
+        confirmed: true, filter_ci: -1
+      })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    // A second lightweight notification closes the race with the database write.
+    announceTemplateRefresh(tpl);
+  } catch (err) {
+    console.warn('[Supabase] Error saving template:', err);
+    showToast('La plantilla quedó local; revisa la conexión', 'error');
+  }
 }
 
 function syncTplInputs(tpl){
@@ -2079,13 +2399,14 @@ function syncTplInputs(tpl){
 }
 
 function renderTemplateList(){
-  const list=$('tpl-list');list.innerHTML='';
+  updateTemplateLibraryCount();
+  const list=$('tpl-list');if(!list)return;list.innerHTML='';
   if (!templates || templates.length === 0) {
     list.innerHTML = '<div class="tpl-empty-state"><svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg><p>No hay plantillas cargadas</p><span>Sube una imagen para usarla como guía de trazado en el lienzo</span></div>';
     return;
   }
   templates.forEach(tpl=>{
-    const div=document.createElement('div');div.className='tpl-item'+(tpl.confirmed?' confirmed':' pending');
+    const div=document.createElement('div');div.className='tpl-item'+(tpl.confirmed?' confirmed':' pending')+(tpl.id===activePaintingTemplateId?' selected':'')+(tpl.remoteLoading?' loading':'');
     const thumbImg=document.createElement('img');
     thumbImg.className='tpl-item-thumb';
     if (tpl.origImageURL) {
@@ -2102,6 +2423,7 @@ function renderTemplateList(){
             '<div class="tpl-item-name" title="'+escapeHtml(tpl.name)+'">'+escapeHtml(tpl.name)+'</div>'+
             '<div class="tpl-badge pending">📌 Ajuste de tamaño</div>'+
           '</div>'+
+          '<button class="tpl-more-btn" data-act="more" title="Más opciones" aria-label="Más opciones">⋮</button>'+
           '<div class="tpl-item-actions">'+
             '<button class="tpl-icon-btn '+(tpl.visible?'active':'')+'" data-act="vis" title="Mostrar/Ocultar">'+(tpl.visible?eyeOpen():eyeClosed())+'</button>'+
             '<button class="tpl-icon-btn danger" data-act="del" title="Eliminar"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>'+
@@ -2120,13 +2442,11 @@ function renderTemplateList(){
           '<div class="tpl-item-thumb-slot"></div>'+
           '<div class="tpl-item-info">'+
             '<div class="tpl-item-name" title="'+escapeHtml(tpl.name)+'">'+escapeHtml(tpl.name)+'</div>'+
-            '<div class="tpl-confirmed-info">'+Math.round(tpl.w)+'×'+Math.round(tpl.h)+' px • ('+Math.round(tpl.x)+', '+Math.round(tpl.y)+')</div>'+
+            '<div class="tpl-confirmed-info">'+(tpl.remoteLoading?'Sincronizando imagen…':Math.round(tpl.w)+'×'+Math.round(tpl.h)+' px • ('+Math.round(tpl.x)+', '+Math.round(tpl.y)+')')+'</div>'+
           '</div>'+
+          '<button class="tpl-more-btn" data-act="more" title="Más opciones" aria-label="Más opciones">⋮</button>'+
           '<div class="tpl-item-actions">'+
             '<button class="tpl-icon-btn '+(tpl.visible?'active':'')+'" data-act="vis" title="Mostrar/Ocultar">'+(tpl.visible?eyeOpen():eyeClosed())+'</button>'+
-            '<button class="tpl-icon-btn '+(tpl.filterActive?'active':'')+'" data-act="filter" title="Filtrar por color seleccionado" style="'+(tpl.filterActive?'border-color:'+fc+';box-shadow:0 0 0 2px '+fc+'44;':'')+'">'+
-              '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>'+
-            '</button>'+
             '<button class="tpl-icon-btn" data-act="stamp" title="Estampar plantilla en canvas">'+
               '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 8V3a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v5"/><path d="M3 21v-1h18v1"/><rect x="3" y="11" width="18" height="9" rx="2"/></svg>'+
             '</button>'+
@@ -2141,36 +2461,44 @@ function renderTemplateList(){
             '<span class="tpl-opacity-val">'+Math.round(tpl.opacity*100)+'%</span>'+
           '</div>'+
         '</div>';
-      div.querySelector('[data-act="filter"]').addEventListener('click',()=>{
-        tpl.filterActive=!tpl.filterActive;
-        if(tpl.filterActive){const ci=nearestPaletteIndex(currentColorHex);tpl.filterCI=ci;tpl.filterCanvas=makeFilterStitchCanvas(tpl.rawIndices,tpl.w,tpl.h,ci);showToast('Filtro: '+paletteHex[ci].toUpperCase(),'');}
-        else showToast('Filtro desactivado','');
-        renderTemplateList();markDirty();
-        sendTemplateUpdate(tpl);
-      });
       div.querySelector('[data-act="stamp"]').addEventListener('click',()=>{
         stampTemplate(tpl);
       });
     }
+    const main=div.querySelector('.tpl-item-main');
+    if(main)main.addEventListener('click',e=>{
+      if(e.target.closest('button'))return;
+      if(tpl.confirmed)selectTemplateForPainting(tpl);
+      else openTemplateAdjustment(tpl);
+    });
+    const moreBtn=div.querySelector('[data-act="more"]');
+    if(moreBtn)moreBtn.addEventListener('click',e=>{
+      e.stopPropagation();
+      div.classList.toggle('details-open');
+    });
     div.querySelector('.tpl-item-thumb-slot').appendChild(thumbImg);
-    div.querySelector('[data-act="vis"]').addEventListener('click',()=>{
+    div.querySelector('[data-act="vis"]').addEventListener('click',e=>{
+      e.stopPropagation();
       tpl.visible=!tpl.visible;
       renderTemplateList();markDirty();scheduleTemplateSave();
       sendTemplateUpdate(tpl);
     });
-    div.querySelector('[data-act="del"]').addEventListener('click',()=>{
+    div.querySelector('[data-act="del"]').addEventListener('click',e=>{
+      e.stopPropagation();
       deleteTemplate(tpl.id);
     });
     const opIn=div.querySelector('.tpl-opacity-inp'),opVal=div.querySelector('.tpl-opacity-val');
-    opIn.addEventListener('input',e=>{
-      tpl.opacity=parseFloat(e.target.value);
-      opVal.textContent=Math.round(tpl.opacity*100)+'%';
-      markDirty();
-    });
-    opIn.addEventListener('change',()=>{
-      scheduleTemplateSave();
-      sendTemplateUpdate(tpl);
-    });
+    if (opIn && opVal) {
+      opIn.addEventListener('input',e=>{
+        tpl.opacity=parseFloat(e.target.value);
+        opVal.textContent=Math.round(tpl.opacity*100)+'%';
+        markDirty();
+      });
+      opIn.addEventListener('change',()=>{
+        scheduleTemplateSave();
+        sendTemplateUpdate(tpl);
+      });
+    }
     list.appendChild(div);
   });
 }
@@ -2185,7 +2513,7 @@ function loadPrefs(){try{const p=JSON.parse(localStorage.getItem('bplace_prefs')
 /* === SVG helpers === */
 function eyeOpen(){return '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';}
 function eyeClosed(){return '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22"/></svg>';}
-function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 /* =====================================================================
    INIT
@@ -2194,41 +2522,29 @@ window.addEventListener('DOMContentLoaded', async () => {
   resize();
   new ResizeObserver(()=>{resize();if(ghostCanvas.width!==mainCanvas.width){ghostCanvas.width=mainCanvas.width;ghostCanvas.height=mainCanvas.height;}}).observe(wrap);
 
-  /* === Panel slide tab button (inject into #tpl-panel) === */
+  /* === Template library and contextual actions === */
   const tplPanel = $('tpl-panel');
-  const tabBtn   = document.createElement('button');
-  tabBtn.id        = 'tpl-panel-tab';
-  tabBtn.className = 'tpl-panel-tab';
-  tabBtn.title     = 'Contraer plantillas';
-  tabBtn.innerHTML = '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>';
-  tabBtn.addEventListener('click', toggleTplPanel);
-  tplPanel.appendChild(tabBtn);
-
-  /* X button: fully close panel */
   $('btn-tpl-x').addEventListener('click', () => {
     playCloseSound();
-    tplPanel.classList.add('hidden');
-    tplPanel.classList.remove('collapsed');
-    updatePanelTabIcon();
+    closeTemplateLibrary();
   });
-  /* Toolbar open: toggle template panel */
   $('btn-tpl-open').addEventListener('click', () => {
-    const isHidden = tplPanel.classList.contains('hidden');
-    const isCollapsed = tplPanel.classList.contains('collapsed');
-    
-    if (isHidden || isCollapsed) {
-      tplPanel.classList.remove('hidden');
-      tplPanel.classList.remove('collapsed');
-    } else {
-      tplPanel.classList.add('hidden');
-    }
-    updatePanelTabIcon();
+    if (tplPanel.classList.contains('hidden')) openTemplateLibrary();
+    else closeTemplateLibrary();
   });
+  const tplContextBack = $('tpl-context-back');
+  if (tplContextBack) tplContextBack.addEventListener('click', () => exitTemplatePainting(true));
+  const tplContextFilter = $('tpl-context-filter');
+  if (tplContextFilter) tplContextFilter.addEventListener('click', () => toggleTemplateFilter(getActivePaintingTemplate()));
+  const tplContextLock = $('tpl-context-lock');
+  if (tplContextLock) tplContextLock.addEventListener('click', () => setCanvasLocked(!canvasLocked));
+  updateTemplateLibraryCount();
+  updateCanvasLockUI();
 
   /* === Canvas mouse events (override with template handling) === */
   mainCanvas.addEventListener('mousedown', e => {
     e.preventDefault();
-    const rect=mainCanvas.getBoundingClientRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
+    const rect=getCanvasRect(true),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
     if(e.button===1||e.button===2){onMouseDown(e);return;}
     if(e.button===0){
       const hit=hitTestHandles(sx,sy);
@@ -2239,7 +2555,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   mainCanvas.addEventListener('mousemove', e => {
-    const rect=mainCanvas.getBoundingClientRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
+    const rect=getCanvasRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
     if(resizeTpl&&resizeHandle){
       mainCanvas.style.cursor=HANDLE_CURSORS[resizeHandle]||'default';
       const dcx=(sx-resizeStart.sx)/vz,dcy=(sy-resizeStart.sy)/vz;
@@ -2386,7 +2702,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         activeAdjustingTpl.y = Math.round(clamp(vy + (viewH - activeAdjustingTpl.h) / 2, 0, CS - activeAdjustingTpl.h));
         updateAdjustCardDimensions(activeAdjustingTpl);
         markDirty();
-        sendTemplateUpdate(activeAdjustingTpl);
+        if (!activeAdjustingTpl.draft) sendTemplateUpdate(activeAdjustingTpl);
         showToast('Plantilla centrada', '');
       }
     });
@@ -2412,7 +2728,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         activeAdjustingTpl.y = Math.round(clamp(vy + (viewH - activeAdjustingTpl.h) / 2, 0, CS - activeAdjustingTpl.h));
         updateAdjustCardDimensions(activeAdjustingTpl);
         markDirty();
-        sendTemplateUpdate(activeAdjustingTpl);
+        if (!activeAdjustingTpl.draft) sendTemplateUpdate(activeAdjustingTpl);
         showToast('Tamaño ajustado', '');
       }
     });
@@ -2421,7 +2737,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('btn-fit').addEventListener('click',fitCanvas);
   $('btn-clear').addEventListener('click', async () => {
     if (!confirm('¿Limpiar todo el canvas? Esta acción borrará el lienzo para todos.')) return;
-    offCtx.fillStyle = '#FFFFFF';
+    setOffscreenPaletteColor(0);
     offCtx.fillRect(0, 0, CS, CS);
     if (canvasData) canvasData.fill(0);
     idbSave(canvasData);
@@ -2455,7 +2771,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('custom-color').addEventListener('change',e=>setCurrentColor(e.target.value));
   $('btn-add-color').addEventListener('click',()=>addToFavColors($('custom-color').value));
   $('btn-tpl-upload').addEventListener('click',()=>$('tpl-file').click());
-  $('tpl-file').addEventListener('change',e=>{Array.from(e.target.files).forEach(loadTemplateFile);e.target.value='';});
+  $('tpl-file').addEventListener('change',e=>{const file=e.target.files&&e.target.files[0];if(file)loadTemplateFile(file);e.target.value='';});
   document.querySelectorAll('.scale-btn').forEach(b=>{b.addEventListener('click',()=>{document.querySelectorAll('.scale-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');exportScale=parseInt(b.dataset.scale);$('export-info').textContent='Tamano: '+(CS*exportScale)+'x'+(CS*exportScale)+' px';});});
   $('btn-export-ok').addEventListener('click',()=>{$('export-dialog').classList.add('hidden');doExport();});
   $('btn-export-cancel').addEventListener('click',()=>{$('export-dialog').classList.add('hidden');playCloseSound();});
@@ -2489,7 +2805,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         setLoadTxt('¡Listo!');
       } else {
         canvasData = new Uint8Array(CS * CS);
-        offCtx.fillStyle = '#FFFFFF';
+        setOffscreenPaletteColor(0);
         offCtx.fillRect(0, 0, CS, CS);
         setLoadTxt('Lienzo nuevo');
       }
@@ -2500,7 +2816,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   } finally {
     hideLoading();
   }
-  setInterval(() => { if (canvasData) idbSave(canvasData); }, 60000);
+  setInterval(() => {
+    if (canvasData && canvasPersistenceDirty) {
+      canvasPersistenceDirty = false;
+      idbSave(canvasData);
+    }
+  }, 60000);
 
   loadPrefs();buildPalette();renderRecentColors();renderFavColors();
   setCurrentColor(currentColorHex,false);setBgColor(bgColorHex);
@@ -2594,29 +2915,18 @@ window.addEventListener('DOMContentLoaded', async () => {
   /* Lock movement button */
   const btnLock = $('btn-lock');
   if (btnLock) {
-    btnLock.addEventListener('click', () => {
-      canvasLocked = !canvasLocked;
-      btnLock.classList.toggle('active', canvasLocked);
-      const icon = $('lock-icon');
-      if (canvasLocked) {
-        icon.innerHTML = '<path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="3" y="11" width="18" height="11" rx="2"/>';
-        showToast('Lienzo bloqueado: Desliza para pintar', 'success');
-      } else {
-        icon.innerHTML = '<path d="M7 11V7a5 5 0 0 1 9.9-1"/><rect x="3" y="11" width="18" height="11" rx="2"/>';
-        showToast('Lienzo libre: Desliza para mover, toca para pintar', 'success');
-      }
-    });
+    btnLock.addEventListener('click', () => setCanvasLocked(!canvasLocked));
   }
 
   /* === Touch events for canvas === */
   let touchState = null, lastPinchDist = 0;
 
   const handleTouchStart = (e) => {
-    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
+    if (e.target.closest('#topbar') || e.target.closest('#canvas-actions') || e.target.closest('#tpl-context-toolbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
       return;
     }
     e.preventDefault();
-    const rect = mainCanvas.getBoundingClientRect();
+    const rect = getCanvasRect(true);
     cachedCanvasRect = rect;
     if (e.touches.length === 1) {
       const t = e.touches[0];
@@ -2706,11 +3016,11 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   const handleTouchMove = (e) => {
     if (!touchState) return;
-    if (e.target.closest('#topbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
+    if (e.target.closest('#topbar') || e.target.closest('#canvas-actions') || e.target.closest('#tpl-context-toolbar') || e.target.closest('#wplace-dock') || e.target.closest('#btn-pintar') || e.target.closest('.floating-panel') || e.target.closest('.dialog-bg') || e.target.closest('#tpl-adjust-card')) {
       return;
     }
     e.preventDefault();
-    const rect = touchState.rect || cachedCanvasRect || mainCanvas.getBoundingClientRect();
+    const rect = touchState.rect || getCanvasRect();
     
     if (touchState.type === 'resize-tpl' && e.touches.length === 1) {
       const t = e.touches[0];
@@ -2797,7 +3107,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   const handleTouchEnd = (e) => {
     if (!touchState) return;
-    const rect = mainCanvas.getBoundingClientRect();
+    const rect = getCanvasRect();
     
     if (touchState.type === 'resize-tpl' || touchState.type === 'drag-tpl') {
       const activeTpl = touchState.tpl || templates.find(t => t.id === touchState.tplId);
