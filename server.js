@@ -135,6 +135,7 @@ function saveUsersLocal() {
 
 // Templates
 let serverTemplates = [];
+const serverStampOps = new Map();
 try {
   serverTemplates = JSON.parse(fs.readFileSync(TEMPLATES_FILE, 'utf8'));
   serverTemplates.forEach(t => { if (t && t.rawIndices) delete t.rawIndices; });
@@ -271,6 +272,31 @@ function scheduleSaveCanvas() {
       cloudSaveTimer = null;
       uploadCanvasToSupabase();
     }, 15000);
+  }
+}
+
+async function refreshServerCanvasFromStorage() {
+  try {
+    const res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin?t=' + Date.now(), 'GET', null, true);
+    if (res.status === 200 && res.data && res.data.length === CANVAS_SIZE * CANVAS_SIZE) {
+      canvas = new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.length);
+      saveCanvasLocal();
+      return true;
+    }
+  } catch (e) {
+    console.warn('[Supabase] No se pudo recuperar el checkpoint:', e.message);
+  }
+  return false;
+}
+
+function finishStampCheckpoint(p) {
+  const received = serverStampOps.get(p && p.opId)?.size || 0;
+  serverStampOps.delete(p && p.opId);
+  if (p && received >= Number(p.totalChunks || 0)) {
+    scheduleSaveCanvas();
+    uploadCanvasToSupabase();
+  } else if (p && p.uploaded) {
+    setTimeout(refreshServerCanvasFromStorage, 600);
   }
 }
 
@@ -531,6 +557,19 @@ wss.on('connection', ws => {
         forwardToSupabaseRealtime('stamp_template', msg);
         break;
       }
+      case 'stamp_chunk': {
+        if (applyStampChunkServer(msg)) {
+          broadcast({ type: 'stamp_chunk', ...msg }, ws);
+          forwardToSupabaseRealtime('stamp_chunk', msg);
+        }
+        break;
+      }
+      case 'stamp_checkpoint': {
+        broadcast({ type: 'stamp_checkpoint', ...msg }, ws);
+        forwardToSupabaseRealtime('stamp_checkpoint', msg);
+        finishStampCheckpoint(msg);
+        break;
+      }
       case 'shape': {
         if (msg.type === 'rect') {
           const lx = Math.max(0, Math.min(msg.x0, msg.x1));
@@ -740,6 +779,30 @@ function applyStampServer(tpl, startX, startY, filterCI) {
   }
 }
 
+function applyStampChunkServer(p) {
+  if (!p || typeof p.data !== 'string' || p.data.length > 24000) return false;
+  const W = Math.max(1, Math.round(Number(p.w) || 0));
+  const ox = Math.round(Number(p.x) || 0), oy = Math.round(Number(p.y) || 0);
+  const offset = Math.max(0, Math.round(Number(p.offset) || 0));
+  const filterCI = Number.isInteger(p.filterCI) ? p.filterCI : -1;
+  let bytes;
+  try { bytes = Buffer.from(p.data, 'base64'); } catch { return false; }
+  for (let i = 0; i < bytes.length; i++) {
+    const absolute = offset + i;
+    const x = ox + (absolute % W), y = oy + Math.floor(absolute / W);
+    const ci = bytes[i];
+    if (x < 0 || x >= CANVAS_SIZE || y < 0 || y >= CANVAS_SIZE || ci === 255 || ci >= PALETTE.length) continue;
+    if (filterCI >= 0 && ci !== filterCI) continue;
+    canvas[y * CANVAS_SIZE + x] = ci;
+  }
+  if (p.opId !== undefined) {
+    let op = serverStampOps.get(p.opId);
+    if (!op) { op = new Set(); serverStampOps.set(p.opId, op); }
+    op.add(offset);
+  }
+  return true;
+}
+
 function connectServerToSupabaseRealtime() {
   const wsUrl = `wss://jtwbuempcdjrbqfgvaar.supabase.co/realtime/v1/websocket?apikey=${SUPABASE_KEY}&vsn=1.0.0`;
   try {
@@ -823,6 +886,11 @@ function connectServerToSupabaseRealtime() {
             executeFloodFillServer(p.x, p.y, p.c);
             broadcast({ type: 'fill', x: p.x, y: p.y, c: p.c });
             scheduleSaveCanvas();
+          } else if (ev === 'stamp_chunk' && p) {
+            if (applyStampChunkServer(p)) broadcast({ type: 'stamp_chunk', ...p });
+          } else if (ev === 'stamp_checkpoint' && p) {
+            broadcast({ type: 'stamp_checkpoint', ...p });
+            finishStampCheckpoint(p);
           } else if (ev === 'stamp_template' && p) {
             const tpl = serverTemplates.find(t => t.id === p.id);
             if (tpl && tpl.rawIndices) {

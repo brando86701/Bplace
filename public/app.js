@@ -51,6 +51,8 @@ let wsBatch = [];
 let wsFlushTimer = null;
 let presenceUsers = new Set();
 const pendingTemplateLoads = new Set();
+const remoteStampOps = new Map();
+let stampSyncInFlight = false;
 
 function announceTemplateRefresh(tpl) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -223,6 +225,16 @@ function connectSupabaseRealtime() {
           scheduleIDBSave();
         } else if (ev === 'fill' && p) {
           executeFloodFill(p.x, p.y, p.c);
+        } else if (ev === 'stamp_chunk' && p) {
+          applyRemoteStampChunk(p);
+        } else if (ev === 'stamp_checkpoint' && p) {
+          const received = remoteStampOps.get(p.opId)?.size || 0;
+          remoteStampOps.delete(p.opId);
+          if (p.uploaded && received < p.totalChunks) {
+            refreshCanvasFromCloudStorage().then(ok => {
+              if (ok) showToast('Lienzo resincronizado', 'success');
+            });
+          }
         } else if (ev === 'stamp_template' && p) {
           const tpl = templates.find(t => String(t.id) === String(p.id));
           if (tpl) {
@@ -605,24 +617,10 @@ function updateOnlineChip(count) {
 }
 
 async function loadCanvasFromServer() {
-  // 1. Try local server endpoint
-  try {
-    const res = await fetch('/api/canvas', { cache: 'no-cache' });
-    if (res.ok) {
-      const buf = await res.arrayBuffer();
-      const data = new Uint8Array(buf);
-      if (data.length === CS * CS) {
-        buildCanvasFromData(data);
-        markDirty();
-        return true;
-      }
-    }
-  } catch (e) {}
-
-  // 2. Fallback: Supabase Storage Global CDN (works on Vercel or when server is remote)
+  // Supabase Storage is the canonical snapshot for every deployment/device.
   try {
     const cdnUrl = SUPABASE_CONFIG.cdnCanvas + '?t=' + Date.now();
-    const res = await fetch(cdnUrl, { cache: 'no-cache' });
+    const res = await fetch(cdnUrl, { cache: 'no-store' });
     if (res.ok) {
       const buf = await res.arrayBuffer();
       const data = new Uint8Array(buf);
@@ -636,11 +634,25 @@ async function loadCanvasFromServer() {
     console.warn('[CDN] No se pudo cargar canvas desde Supabase CDN', e);
   }
 
+  // Local server remains an offline/development fallback.
+  try {
+    const res = await fetch('/api/canvas', { cache: 'no-store' });
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      const data = new Uint8Array(buf);
+      if (data.length === CS * CS) {
+        buildCanvasFromData(data);
+        markDirty();
+        return true;
+      }
+    }
+  } catch (e) {}
+
   return false;
 }
 
 async function uploadCanvasToCloudStorage() {
-  if (!canvasData) return;
+  if (!canvasData) return false;
   try {
     const blob = new Blob([canvasData], { type: 'application/octet-stream' });
     const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
@@ -655,11 +667,30 @@ async function uploadCanvasToCloudStorage() {
     });
     if (res.ok) {
       console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
+      return true;
     } else {
       console.warn('[Supabase Storage] Error al subir lienzo a la nube:', res.status);
+      return false;
     }
   } catch (e) {
     console.warn('[Supabase Storage] Error de red al subir lienzo:', e);
+    return false;
+  }
+}
+
+async function refreshCanvasFromCloudStorage() {
+  try {
+    const res = await fetch(SUPABASE_CONFIG.cdnCanvas + '?checkpoint=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) return false;
+    const data = new Uint8Array(await res.arrayBuffer());
+    if (data.length !== CS * CS) return false;
+    buildCanvasFromData(data);
+    idbSave(canvasData);
+    markDirty();
+    return true;
+  } catch (e) {
+    console.warn('[Canvas] No se pudo recuperar el checkpoint', e);
+    return false;
   }
 }
 
@@ -1344,98 +1375,138 @@ function buildCanvasFromRawIndices(rawIndices, W, H) {
 }
 
 function applyStampTemplate(tpl, startX, startY, filterCI) {
-  if (!tpl || !tpl.rawIndices) return;
+  if (!tpl || !tpl.rawIndices) return 0;
   const W = Math.round(tpl.w);
   const H = Math.round(tpl.h);
   const ox = Math.round(startX);
   const oy = Math.round(startY);
-
-  const buckets = {};
+  let painted = 0;
+  const flushRun = (y, start, end, ci) => {
+    if (ci < 0 || end <= start) return;
+    setOffscreenPaletteColor(ci);
+    offCtx.fillRect(start, y, end - start, 1);
+  };
   for (let py = 0; py < H; py++) {
     const y = oy + py;
     if (y < 0 || y >= CS) continue;
     const rowOffset = y * CS;
     const tplRow = py * W;
+    let runCI = -1, runStart = 0, runEnd = 0;
     for (let px = 0; px < W; px++) {
       const x = ox + px;
-      if (x < 0 || x >= CS) continue;
       const ci = tpl.rawIndices[tplRow + px];
-      if (ci < 0) continue;
-      if (filterCI >= 0 && ci !== filterCI) continue;
+      const valid = x >= 0 && x < CS && ci >= 0 && (filterCI < 0 || ci === filterCI);
+      if (!valid) {
+        flushRun(y, runStart, runEnd, runCI);
+        runCI = -1;
+        continue;
+      }
       if (canvasData) canvasData[rowOffset + x] = ci;
-      if (!buckets[ci]) buckets[ci] = [];
-      buckets[ci].push(x, y);
+      painted++;
+      if (ci === runCI && x === runEnd) runEnd++;
+      else {
+        flushRun(y, runStart, runEnd, runCI);
+        runCI = ci; runStart = x; runEnd = x + 1;
+      }
     }
+    flushRun(y, runStart, runEnd, runCI);
   }
-  for (const ci in buckets) {
-    const coords = buckets[ci];
-    setOffscreenPaletteColor(Number(ci));
-    for (let k = 0; k < coords.length; k += 2) {
-      offCtx.fillRect(coords[k], coords[k + 1], 1, 1);
-    }
+  markDirty();
+  scheduleIDBSave();
+  return painted;
+}
+
+function encodeStampBytes(rawIndices, start, end) {
+  let binary = '';
+  for (let i = start; i < end; i++) binary += String.fromCharCode(rawIndices[i] >= 0 ? rawIndices[i] : 255);
+  return btoa(binary);
+}
+
+function applyRemoteStampChunk(p) {
+  if (!p || typeof p.data !== 'string' || p.data.length > 24000 || !canvasData) return;
+  let binary;
+  try { binary = atob(p.data); } catch (_) { return; }
+  const W = Math.max(1, Math.round(Number(p.w) || 0));
+  const ox = Math.round(Number(p.x) || 0), oy = Math.round(Number(p.y) || 0);
+  const offset = Math.max(0, Math.round(Number(p.offset) || 0));
+  const filterCI = Number.isInteger(p.filterCI) ? p.filterCI : -1;
+  let runCI = -1, runY = -1, runStart = 0, runEnd = 0;
+  const flushRun = () => {
+    if (runCI < 0 || runY < 0 || runEnd <= runStart) return;
+    setOffscreenPaletteColor(runCI);
+    offCtx.fillRect(runStart, runY, runEnd - runStart, 1);
+  };
+  for (let i = 0; i < binary.length; i++) {
+    const absolute = offset + i;
+    const px = absolute % W, py = Math.floor(absolute / W);
+    const x = ox + px, y = oy + py, ci = binary.charCodeAt(i);
+    const valid = x >= 0 && x < CS && y >= 0 && y < CS && ci < 255 && (filterCI < 0 || ci === filterCI);
+    if (!valid) { flushRun(); runCI = -1; runY = -1; continue; }
+    canvasData[y * CS + x] = ci;
+    if (ci === runCI && y === runY && x === runEnd) runEnd++;
+    else { flushRun(); runCI = ci; runY = y; runStart = x; runEnd = x + 1; }
   }
+  flushRun();
+  let op = remoteStampOps.get(p.opId);
+  if (!op) { op = new Set(); remoteStampOps.set(p.opId, op); }
+  op.add(offset);
   markDirty();
   scheduleIDBSave();
 }
 
-function stampTemplate(tpl) {
+async function waitForRealtimeBuffer() {
+  while (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount > 256 * 1024) {
+    await new Promise(resolve => setTimeout(resolve, 24));
+  }
+}
+
+async function stampTemplate(tpl) {
   if (!tpl.confirmed || !tpl.rawIndices) return;
+  if (stampSyncInFlight) { showToast('Ya se está sincronizando otra plantilla', ''); return; }
+  stampSyncInFlight = true;
   const fci = (tpl.filterActive && tpl.filterCI >= 0) ? tpl.filterCI : -1;
   const W = Math.round(tpl.w);
   const H = Math.round(tpl.h);
   const ox = Math.round(tpl.x);
   const oy = Math.round(tpl.y);
-
-  applyStampTemplate(tpl, tpl.x, tpl.y, fci);
-  playPixelSound();
-
-  // Collect flat pixels for guaranteed synchronization across all clients & server
-  const flat = [];
-  for (let py = 0; py < H; py++) {
-    const y = oy + py;
-    if (y < 0 || y >= CS) continue;
-    const tplRow = py * W;
-    for (let px = 0; px < W; px++) {
-      const x = ox + px;
-      if (x < 0 || x >= CS) continue;
-      const ci = tpl.rawIndices[tplRow + px];
-      if (ci < 0) continue;
-      if (fci >= 0 && ci !== fci) continue;
-      flat.push(x, y, ci);
+  try {
+    showToast('Calcando y sincronizando plantilla…', '');
+    const painted = applyStampTemplate(tpl, ox, oy, fci);
+    playPixelSound();
+    const CHUNK_SIZE = 12000;
+    const totalChunks = Math.ceil(tpl.rawIndices.length / CHUNK_SIZE);
+    const opId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      for (let offset = 0; offset < tpl.rawIndices.length; offset += CHUNK_SIZE) {
+        await waitForRealtimeBuffer();
+        const end = Math.min(offset + CHUNK_SIZE, tpl.rawIndices.length);
+        ws.send(JSON.stringify({
+          topic: 'realtime:bplace', event: 'broadcast',
+          payload: { type: 'broadcast', event: 'stamp_chunk', payload: {
+            opId, id: tpl.id, x: ox, y: oy, w: W, h: H,
+            filterCI: fci, offset, data: encodeStampBytes(tpl.rawIndices, offset, end)
+          } },
+          ref: String(sbMsgRef++)
+        }));
+        // Stay comfortably below realtime message-rate limits on every plan.
+        await new Promise(resolve => setTimeout(resolve, 24));
+      }
     }
-  }
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // 1. Send lightweight stamp event for clients that have the template
-    ws.send(JSON.stringify({
-      topic: 'realtime:bplace',
-      event: 'broadcast',
-      payload: {
-        type: 'broadcast',
-        event: 'stamp_template',
-        payload: { id: tpl.id, x: ox, y: oy, filterCI: fci }
-      },
-      ref: String(sbMsgRef++)
-    }));
-
-    // 2. Stream flat_batch chunks with pacing so the socket buffer never overflows
-    let chunkIdx = 0;
-    const CHUNK_SIZE = 9000;
-    function sendNextChunk() {
-      if (!ws || ws.readyState !== WebSocket.OPEN || chunkIdx >= flat.length) return;
-      const chunk = flat.slice(chunkIdx, chunkIdx + CHUNK_SIZE);
-      chunkIdx += CHUNK_SIZE;
+    const uploaded = await uploadCanvasToCloudStorage();
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
-        topic: 'realtime:bplace',
-        event: 'broadcast',
-        payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
+        topic: 'realtime:bplace', event: 'broadcast',
+        payload: { type: 'broadcast', event: 'stamp_checkpoint', payload: { opId, totalChunks, uploaded } },
         ref: String(sbMsgRef++)
       }));
-      if (chunkIdx < flat.length) setTimeout(sendNextChunk, 35);
     }
-    setTimeout(sendNextChunk, 35);
+    showToast('Plantilla calcada y sincronizada (' + painted + ' px)', 'success');
+  } catch (e) {
+    console.error('[Templates] Error al sincronizar el calcado:', e);
+    showToast('El calcado local terminó, pero falló la sincronización', 'error');
+  } finally {
+    stampSyncInFlight = false;
   }
-  showToast('Plantilla calcada y sincronizada (' + Math.round(flat.length / 3) + ' px)', 'success');
 }
 
 function confirmTemplate(tpl) {
@@ -1588,19 +1659,32 @@ function getZoomDisplay() {
   return zoomDisplayEl;
 }
 
+function getViewportMinZoom() {
+  if (!mainCanvas || !mainCanvas.width || !mainCanvas.height) return MIN_Z;
+  return Math.max(MIN_Z, mainCanvas.width / CS, mainCanvas.height / CS);
+}
+
+function constrainViewport() {
+  const viewW = mainCanvas.width / vz;
+  const viewH = mainCanvas.height / vz;
+  vx = clamp(vx, 0, Math.max(0, CS - viewW));
+  vy = clamp(vy, 0, Math.max(0, CS - viewH));
+}
+
 function doZoom(f, cx, cy) {
-  const nz = clamp(vz * f, MIN_Z, MAX_Z);
+  const nz = clamp(vz * f, getViewportMinZoom(), MAX_Z);
   if (nz === vz) return;
   const wx = cx / vz + vx, wy = cy / vz + vy;
   vz = nz;
   vx = wx - cx / vz;
   vy = wy - cy / vz;
+  constrainViewport();
   const zd = getZoomDisplay();
   if (zd) zd.textContent = Math.round(vz * 100) + '%';
   markDirty();
 }
-function fitCanvas(){vz=Math.min(mainCanvas.width/CS,mainCanvas.height/CS);vx=CS/2-mainCanvas.width/2/vz;vy=CS/2-mainCanvas.height/2/vz;$('zoom-display').textContent=Math.round(vz*100)+'%';markDirty();}
-function goTo(cx,cy){vx=cx-mainCanvas.width/2/vz;vy=cy-mainCanvas.height/2/vz;markDirty();}
+function fitCanvas(){vz=getViewportMinZoom();vx=(CS-mainCanvas.width/vz)/2;vy=(CS-mainCanvas.height/vz)/2;constrainViewport();$('zoom-display').textContent=Math.round(vz*100)+'%';markDirty();}
+function goTo(cx,cy){vx=cx-mainCanvas.width/2/vz;vy=cy-mainCanvas.height/2/vz;constrainViewport();markDirty();}
 
 /* === Tools === */
 function setTool(t){
@@ -1996,7 +2080,7 @@ function onMouseDown(e){
 function onMouseMove(e){
   const rect=getCanvasRect(),sx=e.clientX-rect.left,sy=e.clientY-rect.top,{x,y}=s2c(sx,sy);
   updateHover(sx,sy);
-  if(panning){vx-=(e.clientX-panX)/vz;vy-=(e.clientY-panY)/vz;panX=e.clientX;panY=e.clientY;markDirty();return;}
+  if(panning){vx-=(e.clientX-panX)/vz;vy-=(e.clientY-panY)/vz;panX=e.clientX;panY=e.clientY;constrainViewport();markDirty();return;}
   if(shapeStart&&e.buttons===1){renderGhost(shapeStart.x,shapeStart.y,x,y);return;}
   if(spaceHeld&&inCanvas(x,y)){
     if(tool==='brush'||tool==='erase'){
@@ -2107,7 +2191,7 @@ function toggleMobileSidebar(force) {
 }
 
 /* === Window resize === */
-function resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(mainCanvas.width!==w||mainCanvas.height!==h){mainCanvas.width=w;mainCanvas.height=h;ghostCanvas.width=w;ghostCanvas.height=h;cachedCanvasRect=null;markDirty();}}
+function resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(mainCanvas.width!==w||mainCanvas.height!==h){mainCanvas.width=w;mainCanvas.height=h;ghostCanvas.width=w;ghostCanvas.height=h;cachedCanvasRect=null;const minZoom=getViewportMinZoom();if(vz<minZoom)vz=minZoom;constrainViewport();const zd=getZoomDisplay();if(zd)zd.textContent=Math.round(vz*100)+'%';markDirty();}}
 function setBrushSize(s) {
   brushSize = clamp(s, 1, 32);
   playSelectSound();
@@ -3060,6 +3144,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       // Perform panning
       vx -= (t.clientX - touchState.lastClientX) / vz;
       vy -= (t.clientY - touchState.lastClientY) / vz;
+      constrainViewport();
       touchState.lastClientX = t.clientX;
       touchState.lastClientY = t.clientY;
       markDirty();
@@ -3094,6 +3179,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       /* Pan */
       vx -= (midX - touchState.lastMidX) / vz;
       vy -= (midY - touchState.lastMidY) / vz;
+      constrainViewport();
       /* Zoom */
       if (lastPinchDist > 0 && Math.abs(dist - lastPinchDist) > 1) {
         doZoom(dist / lastPinchDist, midX - rect.left, midY - rect.top);
