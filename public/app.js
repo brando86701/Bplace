@@ -324,6 +324,7 @@ function wsConnect() {
 }
 
 function sendWSShape(shapeData) {
+  scheduleCloudCanvasSave();
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({
     topic: 'realtime:bplace',
@@ -337,6 +338,7 @@ let wsLineBatch = [];
 let wsLineTimer = null;
 
 function queueWSLine(x0, y0, x1, y1, ci, size) {
+  scheduleCloudCanvasSave();
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   wsLineBatch.push(x0, y0, x1, y1, ci, size);
   if (!wsLineTimer) {
@@ -372,6 +374,7 @@ function flushWSLines() {
 }
 
 function queueWSPixel(x, y, ci) {
+  scheduleCloudCanvasSave();
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   // Flat numeric batches avoid allocating one object for every painted pixel.
   wsBatch.push(x, y, ci);
@@ -651,7 +654,7 @@ async function loadCanvasFromServer() {
   return false;
 }
 
-async function uploadCanvasToCloudStorage() {
+async function persistCanvasSnapshot() {
   if (!canvasData) return false;
   try {
     const blob = new Blob([canvasData], { type: 'application/octet-stream' });
@@ -663,7 +666,8 @@ async function uploadCanvasToCloudStorage() {
         'Content-Type': 'application/octet-stream',
         'x-upsert': 'true'
       },
-      body: blob
+      body: blob,
+      signal: AbortSignal.timeout(60000)
     });
     if (res.ok) {
       console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
@@ -678,7 +682,52 @@ async function uploadCanvasToCloudStorage() {
   }
 }
 
+const canvasAutosave = createCanvasAutosave({
+  upload: persistCanvasSnapshot,
+  onStatus(status) {
+    let chip = document.getElementById('canvas-save-status');
+    if (!chip) {
+      chip = document.createElement('span');
+      chip.id = 'canvas-save-status';
+      chip.className = 'chip';
+      chip.setAttribute('role', 'status');
+      document.querySelector('.tb-info-chips')?.appendChild(chip);
+    }
+    chip.textContent = { pending: 'Cambios pendientes', saving: 'Guardando…', saved: 'Guardado', error: 'Sin guardar · reintentando…' }[status];
+    chip.style.color = status === 'error' ? 'var(--danger)' : '';
+  }
+});
+
+function scheduleCloudCanvasSave() {
+  scheduleIDBSave();
+  canvasAutosave.mark();
+}
+
+async function uploadCanvasToCloudStorage() {
+  scheduleCloudCanvasSave();
+  while (canvasAutosave.pending()) {
+    if (!await canvasAutosave.flush()) return false;
+  }
+  return true;
+}
+
+window.addEventListener('online', () => canvasAutosave.flush());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && canvasAutosave.pending()) {
+    idbSave(canvasData);
+    canvasAutosave.flush();
+  }
+});
+window.addEventListener('beforeunload', event => {
+  if (!canvasAutosave.pending()) return;
+  idbSave(canvasData);
+  canvasAutosave.flush();
+  event.preventDefault();
+  event.returnValue = '';
+});
+
 async function refreshCanvasFromCloudStorage() {
+  if (canvasAutosave.pending()) return false;
   try {
     const res = await fetch(SUPABASE_CONFIG.cdnCanvas + '?checkpoint=' + Date.now(), { cache: 'no-store' });
     if (!res.ok) return false;
@@ -1179,6 +1228,32 @@ function drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH) {
   const bitmap = tpl.filterActive && tpl.filterCanvas ? tpl.filterCanvas : tpl.canvas;
   if (!bitmap) return;
 
+  // The bitmap fast path must leave painted cells visible, just like the
+  // detailed guide. Index 0 is the canvas's empty/background color.
+  ctx.save();
+  if (canvasData) {
+    const available = new Path2D();
+    const x0 = Math.max(0, ox, Math.floor(vx));
+    const x1 = Math.min(CS, ox + tplW, Math.ceil(vx + srcW));
+    const y0 = Math.max(0, oy, Math.floor(vy));
+    const y1 = Math.min(CS, oy + tplH, Math.ceil(vy + srcH));
+    for (let y = y0; y < y1; y++) {
+      let runStart = -1;
+      for (let x = x0; x <= x1; x++) {
+        const empty = x < x1 && canvasData[y * CS + x] === 0 &&
+          tpl.rawIndices[(y - oy) * tplW + x - ox] !== 0;
+        if (empty && runStart < 0) runStart = x;
+        if (!empty && runStart >= 0) {
+          const left = Math.round((runStart - vx) * vz);
+          const top = Math.round((y - vy) * vz);
+          available.rect(left, top, Math.round((x - vx) * vz) - left,
+            Math.round((y + 1 - vy) * vz) - top);
+          runStart = -1;
+        }
+      }
+    }
+    ctx.clip(available);
+  }
   ctx.drawImage(bitmap, tx, ty, tw, th);
 
   // Preserve the visual language of an unpainted template at every zoom:
@@ -1187,7 +1262,7 @@ function drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH) {
   const endPX = Math.min(tplW, Math.ceil(vx + srcW - ox));
   const startPY = Math.max(0, Math.floor(vy - oy));
   const endPY = Math.min(tplH, Math.ceil(vy + srcH - oy));
-  if (startPX >= endPX || startPY >= endPY) return;
+  if (startPX >= endPX || startPY >= endPY) { ctx.restore(); return; }
 
   ctx.save();
   ctx.beginPath();
@@ -1207,6 +1282,7 @@ function drawTemplateGuideBitmap(tpl, ox, oy, tplW, tplH, srcW, srcH) {
     ctx.lineTo(tx + tw, sy);
   }
   ctx.stroke();
+  ctx.restore();
   ctx.restore();
 }
 
@@ -1252,9 +1328,8 @@ function renderConfirmedTemplate(tpl, W, H, srcW, srcH) {
         const cx = ox + px;
         if (cx < 0 || cx >= CS) continue;
 
-        // If pixel on canvas is already painted with the template's color,
-        // do not draw the template guide so the solid painted pixel shows completely filled!
-        if (canvasData && canvasData[canvasRow + cx] === ci) {
+        // Any painted color takes precedence over the template guide.
+        if (canvasData && (canvasData[canvasRow + cx] !== 0 || canvasData[canvasRow + cx] === ci)) {
           continue;
         }
 
@@ -1500,7 +1575,7 @@ async function stampTemplate(tpl) {
         ref: String(sbMsgRef++)
       }));
     }
-    showToast('Plantilla calcada y sincronizada (' + painted + ' px)', 'success');
+    showToast(uploaded ? 'Plantilla calcada y sincronizada (' + painted + ' px)' : 'Calcado pendiente de guardar; reintentando…', uploaded ? 'success' : 'error');
   } catch (e) {
     console.error('[Templates] Error al sincronizar el calcado:', e);
     showToast('El calcado local terminó, pero falló la sincronización', 'error');
@@ -1892,6 +1967,7 @@ function executeFloodFill(sx, sy, ni) {
 function floodFill(sx, sy, newHex) {
   const ni = nearestPaletteIndex(newHex);
   executeFloodFill(sx, sy, ni);
+  scheduleCloudCanvasSave();
   playPixelSound();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -2924,7 +3000,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Load shared templates from Supabase Cloud
   loadTemplatesFromCloud().then(ok => {
-    if (!ok) loadTemplatesFromIDB();
+    if (!ok) return restoreTemplatesFromIDB();
   });
 
   /* Theme */

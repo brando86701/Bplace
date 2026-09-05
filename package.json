@@ -4,6 +4,7 @@
   "description": "BPlace — Lienzo colaborativo privado",
   "main": "server.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "start": "node server.js",
     "dev":   "node server.js"
   },

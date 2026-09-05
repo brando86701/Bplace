@@ -75,7 +75,7 @@ function supabaseRequest(endpoint, method = 'GET', data = null, isRaw = false) {
 
       if (postData) {
         headers['Content-Type'] = isBuffer ? 'application/octet-stream' : 'application/json';
-        headers['Content-Length'] = postData.length;
+        headers['Content-Length'] = Buffer.byteLength(postData);
       }
       if (endpoint.includes('/storage/v1/object/') && method === 'POST') {
         headers['x-upsert'] = 'true';
@@ -252,6 +252,8 @@ async function uploadCanvasToSupabase() {
     const res = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', buf);
     if (res.status === 200 || res.status === 201) {
       console.log('[Supabase] ✅ Lienzo guardado exitosamente en Storage CDN.');
+    } else {
+      throw new Error('Storage HTTP ' + res.status);
     }
   } catch (err) {
     isCloudCanvasDirty = true;
