@@ -188,13 +188,23 @@ let cloudSaveTimer = null;
 async function syncFromSupabase() {
   console.log('[Supabase] Sincronizando datos desde la nube...');
   
-  // 1. Sync Canvas from Storage
+  // 1. Sync Canvas from Storage (try canvas.bin.gz then canvas.bin)
   try {
-    const res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin', 'GET', null, true);
-    if (res.status === 200 && res.data && res.data.length === CANVAS_SIZE * CANVAS_SIZE) {
-      canvas = new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.length);
-      saveCanvasLocal();
-      console.log('[Supabase] ✅ Lienzo descargado y sincronizado desde Storage (9 MB).');
+    let res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin.gz?t=' + Date.now(), 'GET', null, true);
+    if (res.status === 200 && res.data) {
+      const decompressed = gunzipSync(res.data);
+      if (decompressed.length === CANVAS_SIZE * CANVAS_SIZE) {
+        canvas = new Uint8Array(decompressed.buffer, decompressed.byteOffset, decompressed.length);
+        saveCanvasLocal();
+        console.log(`[Supabase] ✅ Lienzo descargado y descomprimido desde Storage (${(res.data.length / 1024).toFixed(1)} KB).`);
+      }
+    } else {
+      res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin?t=' + Date.now(), 'GET', null, true);
+      if (res.status === 200 && res.data && res.data.length === CANVAS_SIZE * CANVAS_SIZE) {
+        canvas = new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.length);
+        saveCanvasLocal();
+        console.log('[Supabase] ✅ Lienzo descargado desde Storage (9 MB).');
+      }
     }
   } catch (e) {
     console.warn('[Supabase] No se pudo descargar canvas de Storage (usando copia local):', e.message);
@@ -249,10 +259,10 @@ async function uploadCanvasToSupabase() {
   isUploadingToCloud = true;
   isCloudCanvasDirty = false;
   try {
-    const buf = Buffer.from(canvas);
-    const res = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', buf);
+    const compressed = gzipSync(Buffer.from(canvas.buffer, canvas.byteOffset, canvas.byteLength));
+    const res = await supabaseRequest('/storage/v1/object/bplace/canvas.bin.gz', 'POST', compressed);
     if (res.status === 200 || res.status === 201) {
-      console.log('[Supabase] ✅ Lienzo guardado exitosamente en Storage CDN.');
+      console.log(`[Supabase] ✅ Lienzo guardado exitosamente en Storage CDN (${(compressed.length / 1024).toFixed(1)} KB).`);
     } else {
       throw new Error('Storage HTTP ' + res.status);
     }
@@ -274,13 +284,22 @@ function scheduleSaveCanvas() {
     cloudSaveTimer = setTimeout(() => {
       cloudSaveTimer = null;
       uploadCanvasToSupabase();
-    }, 15000);
+    }, 5000);
   }
 }
 
 async function refreshServerCanvasFromStorage() {
   try {
-    const res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin?t=' + Date.now(), 'GET', null, true);
+    let res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin.gz?t=' + Date.now(), 'GET', null, true);
+    if (res.status === 200 && res.data) {
+      const decompressed = gunzipSync(res.data);
+      if (decompressed.length === CANVAS_SIZE * CANVAS_SIZE) {
+        canvas = new Uint8Array(decompressed.buffer, decompressed.byteOffset, decompressed.length);
+        saveCanvasLocal();
+        return true;
+      }
+    }
+    res = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin?t=' + Date.now(), 'GET', null, true);
     if (res.status === 200 && res.data && res.data.length === CANVAS_SIZE * CANVAS_SIZE) {
       canvas = new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.length);
       saveCanvasLocal();
@@ -358,12 +377,14 @@ app.post('/api/logout', authMW, (req, res) => {
   res.json({ ok: true });
 });
 
-// Mobile upload transport; Storage keeps the existing canonical binary format.
+// Mobile upload transport; saves to local canvas and forwards compressed payload to Storage.
 app.post('/api/canvas/compressed', express.raw({ type: 'application/gzip', limit: '10mb' }), async (req, res) => {
   try {
     const snapshot = gunzipSync(req.body, { maxOutputLength: CANVAS_SIZE * CANVAS_SIZE });
     if (snapshot.length !== CANVAS_SIZE * CANVAS_SIZE) return res.sendStatus(400);
-    const result = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', snapshot);
+    canvas = new Uint8Array(snapshot.buffer, snapshot.byteOffset, snapshot.length);
+    saveCanvasLocal();
+    const result = await supabaseRequest('/storage/v1/object/bplace/canvas.bin.gz', 'POST', req.body);
     if (result.status !== 200 && result.status !== 201) return res.sendStatus(502);
     res.sendStatus(200);
   } catch (error) {
@@ -371,14 +392,10 @@ app.post('/api/canvas/compressed', express.raw({ type: 'application/gzip', limit
   }
 });
 
-// Compress the canonical cloud snapshot before sending it to mobile clients.
+// Compress the canonical snapshot before sending it to clients.
 app.get('/api/canvas/compact', async (_req, res) => {
   try {
-    const result = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin', 'GET', null, true);
-    if (result.status !== 200 || result.data.length !== CANVAS_SIZE * CANVAS_SIZE) {
-      return res.status(502).json({ error: 'Canvas unavailable' });
-    }
-    const compressed = gzipSync(result.data);
+    const compressed = gzipSync(Buffer.from(canvas.buffer, canvas.byteOffset, canvas.byteLength));
     res.set('Content-Type', 'application/octet-stream');
     res.set('Content-Encoding', 'gzip');
     res.set('Cache-Control', 'no-store');

@@ -40,6 +40,7 @@ const BASE_PALETTE = [
 const SUPABASE_CONFIG = {
   url: 'https://jtwbuempcdjrbqfgvaar.supabase.co',
   anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp0d2J1ZW1wY2RqcmJxZmd2YWFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgzMTE4OTksImV4cCI6MjEwMzg4Nzg5OX0.562ZWgCbV2eOcDptn_LrT-ONv6DF4yFgZGY6ttiZsjg',
+  cdnCanvasGz: 'https://jtwbuempcdjrbqfgvaar.supabase.co/storage/v1/object/public/bplace/canvas.bin.gz',
   cdnCanvas: 'https://jtwbuempcdjrbqfgvaar.supabase.co/storage/v1/object/public/bplace/canvas.bin'
 };
 
@@ -706,36 +707,53 @@ function updateOnlineChip(count) {
   }
 }
 
+async function compressUint8(data) {
+  if (typeof CompressionStream !== 'undefined') {
+    try {
+      const cs = new CompressionStream('gzip');
+      const writer = cs.writable.getWriter();
+      writer.write(data);
+      writer.close();
+      const arrayBuffer = await new Response(cs.readable).arrayBuffer();
+      return new Uint8Array(arrayBuffer);
+    } catch (e) {
+      console.warn('[Compression] Error al comprimir, usando datos sin procesar:', e);
+    }
+  }
+  return data;
+}
+
+async function decompressUint8(data) {
+  if (data && data.length > 2 && data[0] === 0x1f && data[1] === 0x8b) {
+    if (typeof DecompressionStream !== 'undefined') {
+      try {
+        const ds = new DecompressionStream('gzip');
+        const writer = ds.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        const arrayBuffer = await new Response(ds.readable).arrayBuffer();
+        return new Uint8Array(arrayBuffer);
+      } catch (e) {
+        console.warn('[Decompression] Error al descomprimir gzip:', e);
+      }
+    }
+  }
+  return data;
+}
+
 async function downloadCanvasSnapshot(url) {
   const controller = new AbortController();
-  let timer;
-  const armTimeout = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => controller.abort(), 15000);
-  };
-  armTimeout();
+  const timer = setTimeout(() => controller.abort(), 20000);
   try {
     const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
     if (!res.ok) throw new Error('Canvas HTTP ' + res.status);
-    const data = new Uint8Array(CS * CS);
-    const reader = res.body.getReader();
-    let received = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (received + value.length > data.length) {
-        await reader.cancel();
-        throw new Error('Invalid canvas size');
-      }
-      data.set(value, received);
-      received += value.length;
-      armTimeout();
-      const percent = Math.round(received / data.length * 100);
-      setProgress(15 + percent * 0.75);
-      setLoadTxt('Descargando lienzo… ' + percent + '%');
+    const rawBuffer = await res.arrayBuffer();
+    const rawUint8 = new Uint8Array(rawBuffer);
+    const decompressed = await decompressUint8(rawUint8);
+    if (decompressed.length !== CS * CS) {
+      throw new Error(`Tamaño de lienzo inválido: se esperaban ${CS * CS} bytes, se obtuvieron ${decompressed.length}`);
     }
-    if (received !== data.length) throw new Error('Incomplete canvas');
-    return data;
+    return decompressed;
   } finally {
     clearTimeout(timer);
   }
@@ -749,53 +767,90 @@ function loadCanvasFromServer() {
   }
   return snapshotRefresh;
 }
+
 async function fetchCanvasSnapshot() {
-  const baseline = canvasData ? canvasData.slice() : null;
   const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
   const candidateUrls = isLocal
-    ? ['/api/canvas/compact', `${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`, '/api/canvas']
-    : [`${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`];
+    ? [
+        `${SUPABASE_CONFIG.cdnCanvasGz}?t=${Date.now()}`,
+        '/api/canvas/compact',
+        `${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`,
+        '/api/canvas'
+      ]
+    : [
+        `${SUPABASE_CONFIG.cdnCanvasGz}?t=${Date.now()}`,
+        `${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`
+      ];
 
   for (const url of candidateUrls) {
     try {
       const data = await downloadCanvasSnapshot(url);
-      // Preserve edits received or painted while the snapshot was in transit.
-      if (baseline && canvasData) {
-        for (let i = 0; i < data.length; i++) {
-          if (canvasData[i] !== baseline[i]) data[i] = canvasData[i];
+      if (!data || data.length !== CS * CS) continue;
+
+      // Smart non-destructive merge:
+      // If local already had painted pixels (from IDB or active session) and remote has 0 (blank)
+      // at those coordinates, preserve local pixels so local drawings are never wiped!
+      let hasLocalAdditions = false;
+      if (canvasData) {
+        for (let i = 0; i < CS * CS; i++) {
+          if (data[i] !== 0) {
+            // Remote has a painted pixel: authoritative
+            continue;
+          } else if (canvasData[i] !== 0) {
+            // Remote is 0 but local has a painted pixel: preserve local drawing
+            data[i] = canvasData[i];
+            hasLocalAdditions = true;
+          }
         }
       }
+
       buildCanvasFromData(data);
       idbSave(data);
       markDirty();
+
+      // If we merged local additions that were missing in the remote snapshot, schedule cloud upload
+      if (hasLocalAdditions) {
+        scheduleCloudCanvasSave();
+      }
+
       return true;
     } catch (error) {
-      console.warn('[Canvas] Download failed; trying fallback', error);
+      console.warn('[Canvas] Falló descarga desde', url, error.message);
     }
   }
   return false;
 }
 
-async function persistCanvasSnapshot() {
+async function persistCanvasSnapshot(options = {}) {
   if (snapshotRefresh && !await snapshotRefresh) return false;
   if (!canvasData) return false;
   try {
-    const blob = new Blob([canvasData], { type: 'application/octet-stream' });
-    const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
+    const compressed = await compressUint8(canvasData);
+    const isCompressed = compressed.length !== canvasData.length;
+    const blob = new Blob([compressed], { type: isCompressed ? 'application/gzip' : 'application/octet-stream' });
+    const targetPath = isCompressed ? 'canvas.bin.gz' : 'canvas.bin';
+
+    const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/${targetPath}`, {
       method: 'POST',
       headers: {
         apikey: SUPABASE_CONFIG.anonKey,
         Authorization: 'Bearer ' + SUPABASE_CONFIG.anonKey,
-        'Content-Type': 'application/octet-stream',
+        'Content-Type': isCompressed ? 'application/gzip' : 'application/octet-stream',
         'x-upsert': 'true'
       },
       body: blob,
-      signal: AbortSignal.timeout(45000)
+      keepalive: !!options?.keepalive && blob.size < 60000,
+      signal: AbortSignal.timeout(15000)
     });
+
     if (res.ok) {
-      console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
+      console.log(`[Supabase Storage] ✅ Lienzo guardado y sincronizado (${(blob.size / 1024).toFixed(1)} KB)`);
       if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-        fetch('/api/canvas', { method: 'POST', body: blob }).catch(() => {});
+        if (isCompressed) {
+          fetch('/api/canvas/compressed', { method: 'POST', headers: { 'Content-Type': 'application/gzip' }, body: blob }).catch(() => {});
+        } else {
+          fetch('/api/canvas', { method: 'POST', body: blob }).catch(() => {});
+        }
       }
       return true;
     } else {
@@ -842,13 +897,13 @@ window.addEventListener('online', () => canvasAutosave.flush());
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden' && canvasAutosave.pending()) {
     idbSave(canvasData);
-    canvasAutosave.flush();
+    canvasAutosave.flush({ keepalive: true });
   }
 });
 window.addEventListener('pagehide', () => {
   if (!canvasAutosave.pending()) return;
   idbSave(canvasData);
-  canvasAutosave.flush();
+  canvasAutosave.flush({ keepalive: true });
 });
 
 async function refreshCanvasFromCloudStorage() {

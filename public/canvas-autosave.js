@@ -13,13 +13,13 @@ function createCanvasAutosave({ upload, onStatus = () => {}, delay = 1000, retry
     onStatus('pending');
     schedule(delay);
   }
-  function flush() {
+  function flush(options = {}) {
     if (timer !== null) { clearTimeout(timer); timer = null; }
     if (inFlight) return inFlight;
     if (!pending()) return Promise.resolve(true);
     const uploadingRevision = revision;
     onStatus('saving');
-    inFlight = Promise.resolve().then(upload).then(ok => {
+    inFlight = Promise.resolve().then(() => upload(options)).then(ok => {
       if (ok) savedRevision = uploadingRevision;
       onStatus(ok ? (pending() ? 'pending' : 'saved') : 'error');
       return !!ok;
@@ -34,3 +34,4 @@ function createCanvasAutosave({ upload, onStatus = () => {}, delay = 1000, retry
 }
 
 if (typeof module !== 'undefined') module.exports = { createCanvasAutosave };
+
