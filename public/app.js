@@ -51,7 +51,13 @@ function sendRealtime(message) {
     pendingBroadcasts.push(message);
     return;
   }
-  ws.send(JSON.stringify(message));
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify(message));
+    } catch (e) {
+      console.warn('[Realtime] Error enviando mensaje:', e);
+    }
+  }
 }
 
 let sbHeartbeatInterval = null;
@@ -745,8 +751,12 @@ function loadCanvasFromServer() {
 }
 async function fetchCanvasSnapshot() {
   const baseline = canvasData ? canvasData.slice() : null;
-  // Try the canonical snapshot first, then the local server fallback.
-  for (const url of ['/api/canvas/compact', SUPABASE_CONFIG.cdnCanvas, '/api/canvas']) {
+  const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+  const candidateUrls = isLocal
+    ? ['/api/canvas/compact', `${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`, '/api/canvas']
+    : [`${SUPABASE_CONFIG.cdnCanvas}?t=${Date.now()}`];
+
+  for (const url of candidateUrls) {
     try {
       const data = await downloadCanvasSnapshot(url);
       // Preserve edits received or painted while the snapshot was in transit.
@@ -771,14 +781,6 @@ async function persistCanvasSnapshot() {
   if (!canvasData) return false;
   try {
     const blob = new Blob([canvasData], { type: 'application/octet-stream' });
-    if (typeof CompressionStream !== 'undefined') {
-      const compressed = await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
-      const response = await fetch('/api/canvas/compressed', {
-        method: 'POST', headers: { 'Content-Type': 'application/gzip' },
-        body: compressed, signal: AbortSignal.timeout(60000)
-      });
-      return response.ok;
-    }
     const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
       method: 'POST',
       headers: {
@@ -788,10 +790,13 @@ async function persistCanvasSnapshot() {
         'x-upsert': 'true'
       },
       body: blob,
-      signal: AbortSignal.timeout(60000)
+      signal: AbortSignal.timeout(45000)
     });
     if (res.ok) {
       console.log('[Supabase Storage] ✅ Lienzo guardado y sincronizado en la nube');
+      if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+        fetch('/api/canvas', { method: 'POST', body: blob }).catch(() => {});
+      }
       return true;
     } else {
       console.warn('[Supabase Storage] Error al subir lienzo a la nube:', res.status);
