@@ -311,6 +311,10 @@ function connectSupabaseRealtime() {
             syncTplInputs(tpl);
             renderTemplateList();
             markDirty();
+            saveTemplatesToIDB();
+          } else if (!tpl && p.id !== undefined) {
+            ensureRemoteTemplatePlaceholder({ id: p.id, ...(p.updates || {}) });
+            fetchAndAddCloudTemplate(p.id);
           }
         } else if (ev === 'template_delete') {
           if (String(activePaintingTemplateId) === String(p.id)) exitTemplatePainting(false);
@@ -318,6 +322,7 @@ function connectSupabaseRealtime() {
           templates = templates.filter(t => String(t.id) !== String(p.id));
           renderTemplateList();
           markDirty();
+          saveTemplatesToIDB();
         }
       }
     });
@@ -2563,6 +2568,7 @@ async function publishTemplate(tpl) {
   // A Base64 image can be several MB and exceed the realtime message limit.
   // Broadcast only the id; every device downloads the persisted row by HTTP.
   announceTemplateRefresh(tpl);
+  sendTemplateUpdate(tpl);
   try {
     const res = await fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates`, {
       method: 'POST',
@@ -2582,6 +2588,7 @@ async function publishTemplate(tpl) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     // A second lightweight notification closes the race with the database write.
     announceTemplateRefresh(tpl);
+    sendTemplateUpdate(tpl);
   } catch (err) {
     console.warn('[Supabase] Error saving template:', err);
     showToast('La plantilla quedó local; revisa la conexión', 'error');
