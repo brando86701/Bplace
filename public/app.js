@@ -654,12 +654,17 @@ async function downloadCanvasSnapshot(url) {
   }
 }
 
+let canvasEditRevision = 0;
+
 async function loadCanvasFromServer() {
+  const revision = canvasEditRevision;
   // Try the canonical snapshot first, then the local server fallback.
-  for (const url of [SUPABASE_CONFIG.cdnCanvas + '?t=' + Date.now(), '/api/canvas']) {
+  for (const url of ['/api/canvas/compact', SUPABASE_CONFIG.cdnCanvas, '/api/canvas']) {
     try {
       const data = await downloadCanvasSnapshot(url);
+      if (canvasEditRevision !== revision || canvasAutosave.pending()) return true;
       buildCanvasFromData(data);
+      idbSave(data);
       markDirty();
       return true;
     } catch (error) {
@@ -714,6 +719,7 @@ const canvasAutosave = createCanvasAutosave({
 });
 
 function scheduleCloudCanvasSave() {
+  canvasEditRevision++;
   scheduleIDBSave();
   canvasAutosave.mark();
 }
@@ -733,12 +739,10 @@ document.addEventListener('visibilitychange', () => {
     canvasAutosave.flush();
   }
 });
-window.addEventListener('beforeunload', event => {
+window.addEventListener('pagehide', () => {
   if (!canvasAutosave.pending()) return;
   idbSave(canvasData);
   canvasAutosave.flush();
-  event.preventDefault();
-  event.returnValue = '';
 });
 
 async function refreshCanvasFromCloudStorage() {
@@ -2965,7 +2969,14 @@ window.addEventListener('DOMContentLoaded', async () => {
     
     // Fast path: Fetch latest binary state from server directly
     setProgress(40); setLoadTxt('Descargando lienzo...');
-    const loadedFromServer = await loadCanvasFromServer();
+    const cached = await Promise.race([
+      openIDB().then(() => idbLoad()).catch(() => null),
+      new Promise(resolve => setTimeout(() => resolve(null), 800))
+    ]);
+    const hasCache = cached && cached.length === CS * CS;
+    if (hasCache) buildCanvasFromData(cached);
+    const loadedFromServer = hasCache || await loadCanvasFromServer();
+    if (hasCache) loadCanvasFromServer().catch(console.warn);
     
     if (loadedFromServer) {
       setProgress(90); setLoadTxt('¡Sincronizado!');

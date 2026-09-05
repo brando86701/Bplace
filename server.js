@@ -7,6 +7,7 @@ const fs        = require('fs');
 const path      = require('path');
 const crypto    = require('crypto');
 const os        = require('os');
+const { gzipSync } = require('zlib');
 
 // Load environment variables from .env if present
 try {
@@ -355,6 +356,23 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', authMW, (req, res) => {
   sessions.delete((req.headers.authorization || '').replace('Bearer ', ''));
   res.json({ ok: true });
+});
+
+// Compress the canonical cloud snapshot before sending it to mobile clients.
+app.get('/api/canvas/compact', async (_req, res) => {
+  try {
+    const result = await supabaseRequest('/storage/v1/object/public/bplace/canvas.bin', 'GET', null, true);
+    if (result.status !== 200 || result.data.length !== CANVAS_SIZE * CANVAS_SIZE) {
+      return res.status(502).json({ error: 'Canvas unavailable' });
+    }
+    const compressed = gzipSync(result.data);
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Encoding', 'gzip');
+    res.set('Cache-Control', 'no-store');
+    res.send(compressed);
+  } catch (error) {
+    res.status(502).json({ error: 'Canvas unavailable' });
+  }
 });
 
 // Canvas binary download
