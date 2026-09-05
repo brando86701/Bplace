@@ -619,38 +619,53 @@ function updateOnlineChip(count) {
   }
 }
 
-async function loadCanvasFromServer() {
-  // Supabase Storage is the canonical snapshot for every deployment/device.
+async function downloadCanvasSnapshot(url) {
+  const controller = new AbortController();
+  let timer;
+  const armTimeout = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), 15000);
+  };
+  armTimeout();
   try {
-    const cdnUrl = SUPABASE_CONFIG.cdnCanvas + '?t=' + Date.now();
-    const res = await fetch(cdnUrl, { cache: 'no-store' });
-    if (res.ok) {
-      const buf = await res.arrayBuffer();
-      const data = new Uint8Array(buf);
-      if (data.length === CS * CS) {
-        buildCanvasFromData(data);
-        markDirty();
-        return true;
+    const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    if (!res.ok) throw new Error('Canvas HTTP ' + res.status);
+    const data = new Uint8Array(CS * CS);
+    const reader = res.body.getReader();
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (received + value.length > data.length) {
+        await reader.cancel();
+        throw new Error('Invalid canvas size');
       }
+      data.set(value, received);
+      received += value.length;
+      armTimeout();
+      const percent = Math.round(received / data.length * 100);
+      setProgress(15 + percent * 0.75);
+      setLoadTxt('Descargando lienzo… ' + percent + '%');
     }
-  } catch (e) {
-    console.warn('[CDN] No se pudo cargar canvas desde Supabase CDN', e);
+    if (received !== data.length) throw new Error('Incomplete canvas');
+    return data;
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  // Local server remains an offline/development fallback.
-  try {
-    const res = await fetch('/api/canvas', { cache: 'no-store' });
-    if (res.ok) {
-      const buf = await res.arrayBuffer();
-      const data = new Uint8Array(buf);
-      if (data.length === CS * CS) {
-        buildCanvasFromData(data);
-        markDirty();
-        return true;
-      }
+async function loadCanvasFromServer() {
+  // Try the canonical snapshot first, then the local server fallback.
+  for (const url of [SUPABASE_CONFIG.cdnCanvas + '?t=' + Date.now(), '/api/canvas']) {
+    try {
+      const data = await downloadCanvasSnapshot(url);
+      buildCanvasFromData(data);
+      markDirty();
+      return true;
+    } catch (error) {
+      console.warn('[Canvas] Download failed; trying fallback', error);
     }
-  } catch (e) {}
-
+  }
   return false;
 }
 
@@ -1038,6 +1053,7 @@ function openIDB() {
     };
     req.onsuccess = e => { idb = e.target.result; res(idb); };
     req.onerror   = rej;
+    req.onblocked = () => rej(new Error('IndexedDB blocked'));
   });
 }
 function idbSave(data) {
@@ -2964,17 +2980,22 @@ window.addEventListener('DOMContentLoaded', async () => {
         buildCanvasFromData(saved);
         setLoadTxt('¡Listo!');
       } else {
-        canvasData = new Uint8Array(CS * CS);
-        setOffscreenPaletteColor(0);
-        offCtx.fillRect(0, 0, CS, CS);
-        setLoadTxt('Lienzo nuevo');
+        throw new Error('No se pudo descargar el lienzo y no hay respaldo local');
       }
     }
     setProgress(100);
   } catch (err) {
     console.error('Error durante la carga:', err);
+    setLoadTxt('No se pudo cargar el lienzo. Revisa tu conexión.');
+    const retry = document.createElement('button');
+    retry.textContent = 'Reintentar';
+    retry.className = 'tb-btn';
+    retry.style.cssText = 'margin:16px auto;background:#8478ff;color:white';
+    retry.onclick = () => location.reload();
+    $('ld-txt').after(retry);
+    return;
   } finally {
-    hideLoading();
+    if (canvasData) hideLoading();
   }
   setInterval(() => {
     if (canvasData && canvasPersistenceDirty) {
