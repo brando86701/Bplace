@@ -45,6 +45,15 @@ const SUPABASE_CONFIG = {
 
 let ws = null;
 let wsReady = false;
+const pendingBroadcasts = [];
+function sendRealtime(message) {
+  if (message.event === 'broadcast' && (!wsReady || !ws || ws.readyState !== WebSocket.OPEN)) {
+    pendingBroadcasts.push(message);
+    return;
+  }
+  ws.send(JSON.stringify(message));
+}
+
 let sbHeartbeatInterval = null;
 let sbMsgRef = 1;
 let wsBatch = [];
@@ -60,12 +69,12 @@ function announceTemplateRefresh(tpl) {
     id: tpl.id, name: tpl.name, x: tpl.x, y: tpl.y, w: tpl.w, h: tpl.h,
     opacity: tpl.opacity, visible: tpl.visible, confirmed: true
   } : { id: tpl };
-  ws.send(JSON.stringify({
+  sendRealtime({
     topic: 'realtime:bplace',
     event: 'broadcast',
     payload: { type: 'broadcast', event: 'template_refresh', payload },
     ref: String(sbMsgRef++)
-  }));
+  });
 }
 
 function ensureRemoteTemplatePlaceholder(data) {
@@ -136,22 +145,22 @@ function connectSupabaseRealtime() {
 
     ws.addEventListener('open', () => {
       console.log('[Supabase Realtime] Conectado a la red Edge global');
-      wsReady = true;
+      wsReady = false;
       updateOnlineChip(1);
 
       const userId = 'usr_' + Math.random().toString(36).substring(2, 9);
       // Join realtime channel with broadcast & presence
-      ws.send(JSON.stringify({
+      sendRealtime({
         topic: 'realtime:bplace',
         event: 'phx_join',
         payload: { config: { broadcast: { self: false }, presence: { key: userId } } },
         ref: String(sbMsgRef++)
-      }));
+      });
 
       // Start 25s heartbeat ping to keep connection alive
       sbHeartbeatInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(sbMsgRef++) }));
+          sendRealtime({ topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(sbMsgRef++) });
         }
       }, 25000);
     });
@@ -159,6 +168,13 @@ function connectSupabaseRealtime() {
     ws.addEventListener('message', async e => {
       let msg; try { msg = JSON.parse(e.data); } catch { return; }
       
+      if (msg.event === 'phx_reply' && msg.payload?.status === 'ok' && msg.topic === 'realtime:bplace' && !wsReady) {
+        wsReady = true;
+        while (pendingBroadcasts.length) sendRealtime(pendingBroadcasts.shift());
+        flushWSPixels();
+        flushWSLines();
+        sendRealtime({ topic: 'realtime:bplace', event: 'presence', payload: { type: 'presence', event: 'track', payload: {} }, ref: String(sbMsgRef++) });
+      }
       // Handle presence (live user count across all devices)
       if (msg.event === 'presence_state') {
         presenceUsers = new Set(Object.keys(msg.payload || {}));
@@ -173,6 +189,7 @@ function connectSupabaseRealtime() {
 
       // Handle real-time broadcast events
       if (msg.event === 'broadcast' && msg.payload) {
+        canvasEditRevision++;
         const payloadData = msg.payload;
         const ev = payloadData.event;
         const p = payloadData.payload;
@@ -325,13 +342,12 @@ function wsConnect() {
 
 function sendWSShape(shapeData) {
   scheduleCloudCanvasSave();
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
+  sendRealtime({
     topic: 'realtime:bplace',
     event: 'broadcast',
     payload: { type: 'broadcast', event: 'shape', payload: shapeData },
     ref: String(sbMsgRef++)
-  }));
+  });
 }
 
 let wsLineBatch = [];
@@ -339,7 +355,6 @@ let wsLineTimer = null;
 
 function queueWSLine(x0, y0, x1, y1, ci, size) {
   scheduleCloudCanvasSave();
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   wsLineBatch.push(x0, y0, x1, y1, ci, size);
   if (!wsLineTimer) {
     wsLineTimer = setTimeout(flushWSLines, 16);
@@ -348,10 +363,10 @@ function queueWSLine(x0, y0, x1, y1, ci, size) {
 
 function flushWSLines() {
   wsLineTimer = null;
-  if (!wsLineBatch.length || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!wsLineBatch.length) return;
   try {
     if (wsLineBatch.length === 6) {
-      ws.send(JSON.stringify({
+      sendRealtime({
         topic: 'realtime:bplace',
         event: 'broadcast',
         payload: {
@@ -360,14 +375,14 @@ function flushWSLines() {
           payload: { type: 'line', x0: wsLineBatch[0], y0: wsLineBatch[1], x1: wsLineBatch[2], y1: wsLineBatch[3], c: wsLineBatch[4], size: wsLineBatch[5] }
         },
         ref: String(sbMsgRef++)
-      }));
+      });
     } else {
-      ws.send(JSON.stringify({
+      sendRealtime({
         topic: 'realtime:bplace',
         event: 'broadcast',
         payload: { type: 'broadcast', event: 'lines_batch', payload: wsLineBatch },
         ref: String(sbMsgRef++)
-      }));
+      });
     }
   } catch (e) {}
   wsLineBatch = [];
@@ -375,7 +390,6 @@ function flushWSLines() {
 
 function queueWSPixel(x, y, ci) {
   scheduleCloudCanvasSave();
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   // Flat numeric batches avoid allocating one object for every painted pixel.
   wsBatch.push(x, y, ci);
   if (!wsFlushTimer) {
@@ -386,24 +400,24 @@ function queueWSPixel(x, y, ci) {
 function flushWSPixels() {
   wsFlushTimer = null;
   if (!wsBatch.length) return;
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  {
     try {
       if (wsBatch.length === 3) {
-        ws.send(JSON.stringify({
+        sendRealtime({
           topic: 'realtime:bplace',
           event: 'broadcast',
           payload: { type: 'broadcast', event: 'pixel', payload: { x: wsBatch[0], y: wsBatch[1], c: wsBatch[2] } },
           ref: String(sbMsgRef++)
-        }));
+        });
       } else {
         for (let i = 0; i < wsBatch.length; i += 6000) {
           const chunk = wsBatch.slice(i, i + 6000);
-          ws.send(JSON.stringify({
+          sendRealtime({
             topic: 'realtime:bplace',
             event: 'broadcast',
             payload: { type: 'broadcast', event: 'flat_batch', payload: chunk },
             ref: String(sbMsgRef++)
-          }));
+          });
         }
       }
     } catch (e) {
@@ -475,7 +489,7 @@ function sendTemplateUpdate(tpl) {
 
   // 1. Broadcast to all clients over Supabase Realtime
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
+    sendRealtime({
       topic: 'realtime:bplace',
       event: 'broadcast',
       payload: {
@@ -484,7 +498,7 @@ function sendTemplateUpdate(tpl) {
         payload: { id: tpl.id, updates }
       },
       ref: String(sbMsgRef++)
-    }));
+    });
   }
 
   // 2. Debounce persist to Supabase PostgreSQL table (prevents HTTP spam during dragging/resizing)
@@ -533,7 +547,7 @@ function deleteTemplate(tplId) {
 
   // 1. Broadcast to all clients over Supabase Realtime
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
+    sendRealtime({
       topic: 'realtime:bplace',
       event: 'broadcast',
       payload: {
@@ -542,7 +556,7 @@ function deleteTemplate(tplId) {
         payload: { id: tplId }
       },
       ref: String(sbMsgRef++)
-    }));
+    });
   }
 
   // 2. Delete from Supabase PostgreSQL table
@@ -655,14 +669,25 @@ async function downloadCanvasSnapshot(url) {
 }
 
 let canvasEditRevision = 0;
-
-async function loadCanvasFromServer() {
-  const revision = canvasEditRevision;
+let snapshotRefresh = null;
+function loadCanvasFromServer() {
+  if (!snapshotRefresh) {
+    snapshotRefresh = fetchCanvasSnapshot().finally(() => { snapshotRefresh = null; });
+  }
+  return snapshotRefresh;
+}
+async function fetchCanvasSnapshot() {
+  const baseline = canvasData ? canvasData.slice() : null;
   // Try the canonical snapshot first, then the local server fallback.
   for (const url of ['/api/canvas/compact', SUPABASE_CONFIG.cdnCanvas, '/api/canvas']) {
     try {
       const data = await downloadCanvasSnapshot(url);
-      if (canvasEditRevision !== revision || canvasAutosave.pending()) return true;
+      // Preserve edits received or painted while the snapshot was in transit.
+      if (baseline && canvasData) {
+        for (let i = 0; i < data.length; i++) {
+          if (canvasData[i] !== baseline[i]) data[i] = canvasData[i];
+        }
+      }
       buildCanvasFromData(data);
       idbSave(data);
       markDirty();
@@ -675,9 +700,18 @@ async function loadCanvasFromServer() {
 }
 
 async function persistCanvasSnapshot() {
+  if (snapshotRefresh && !await snapshotRefresh) return false;
   if (!canvasData) return false;
   try {
     const blob = new Blob([canvasData], { type: 'application/octet-stream' });
+    if (typeof CompressionStream !== 'undefined') {
+      const compressed = await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+      const response = await fetch('/api/canvas/compressed', {
+        method: 'POST', headers: { 'Content-Type': 'application/gzip' },
+        body: compressed, signal: AbortSignal.timeout(60000)
+      });
+      return response.ok;
+    }
     const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/canvas.bin`, {
       method: 'POST',
       headers: {
@@ -747,19 +781,7 @@ window.addEventListener('pagehide', () => {
 
 async function refreshCanvasFromCloudStorage() {
   if (canvasAutosave.pending()) return false;
-  try {
-    const res = await fetch(SUPABASE_CONFIG.cdnCanvas + '?checkpoint=' + Date.now(), { cache: 'no-store' });
-    if (!res.ok) return false;
-    const data = new Uint8Array(await res.arrayBuffer());
-    if (data.length !== CS * CS) return false;
-    buildCanvasFromData(data);
-    idbSave(canvasData);
-    markDirty();
-    return true;
-  } catch (e) {
-    console.warn('[Canvas] No se pudo recuperar el checkpoint', e);
-    return false;
-  }
+  return loadCanvasFromServer();
 }
 
 function hexToRGB(h) {
@@ -1575,25 +1597,25 @@ async function stampTemplate(tpl) {
       for (let offset = 0; offset < tpl.rawIndices.length; offset += CHUNK_SIZE) {
         await waitForRealtimeBuffer();
         const end = Math.min(offset + CHUNK_SIZE, tpl.rawIndices.length);
-        ws.send(JSON.stringify({
+        sendRealtime({
           topic: 'realtime:bplace', event: 'broadcast',
           payload: { type: 'broadcast', event: 'stamp_chunk', payload: {
             opId, id: tpl.id, x: ox, y: oy, w: W, h: H,
             filterCI: fci, offset, data: encodeStampBytes(tpl.rawIndices, offset, end)
           } },
           ref: String(sbMsgRef++)
-        }));
+        });
         // Stay comfortably below realtime message-rate limits on every plan.
         await new Promise(resolve => setTimeout(resolve, 24));
       }
     }
     const uploaded = await uploadCanvasToCloudStorage();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
+      sendRealtime({
         topic: 'realtime:bplace', event: 'broadcast',
         payload: { type: 'broadcast', event: 'stamp_checkpoint', payload: { opId, totalChunks, uploaded } },
         ref: String(sbMsgRef++)
-      }));
+      });
     }
     showToast(uploaded ? 'Plantilla calcada y sincronizada (' + painted + ' px)' : 'Calcado pendiente de guardar; reintentando…', uploaded ? 'success' : 'error');
   } catch (e) {
@@ -1991,7 +2013,7 @@ function floodFill(sx, sy, newHex) {
   playPixelSound();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
+    sendRealtime({
       topic: 'realtime:bplace',
       event: 'broadcast',
       payload: {
@@ -2000,7 +2022,7 @@ function floodFill(sx, sy, newHex) {
         payload: { x: sx, y: sy, c: ni }
       },
       ref: String(sbMsgRef++)
-    }));
+    });
   }
 }
 function bresenhamLine(x0,y0,x1,y1,fn){const dx=Math.abs(x1-x0),dy=Math.abs(y1-y0),sx=x0<x1?1:-1,sy=y0<y1?1:-1;let err=dx-dy;for(;;){fn(x0,y0);if(x0===x1&&y0===y1)break;const e2=2*err;if(e2>-dy){err-=dy;x0+=sx;}if(e2<dx){err+=dx;y0+=sy;}}}
@@ -2926,12 +2948,12 @@ window.addEventListener('DOMContentLoaded', async () => {
 
     // 1. Broadcast real-time event to all connected users
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
+      sendRealtime({
         topic: 'realtime:bplace',
         event: 'broadcast',
         payload: { type: 'broadcast', event: 'clear', payload: {} },
         ref: String(sbMsgRef++)
-      }));
+      });
     }
 
     // 2. Notify local server if running

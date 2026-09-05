@@ -21,6 +21,7 @@ const assert = require('node:assert/strict');
       return route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
     });
     await context.route('**/api/canvas/compact', route => route.fulfill({ status: 200, contentType: 'application/octet-stream', body: snapshot }));
+    await context.route('**/api/canvas/compressed', route => { snapshot = require('node:zlib').gunzipSync(route.request().postDataBuffer()); writes++; return route.fulfill({ status: 200, body: 'OK' }); });
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));

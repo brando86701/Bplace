@@ -7,7 +7,7 @@ const fs        = require('fs');
 const path      = require('path');
 const crypto    = require('crypto');
 const os        = require('os');
-const { gzipSync } = require('zlib');
+const { gzipSync, gunzipSync } = require('zlib');
 
 // Load environment variables from .env if present
 try {
@@ -356,6 +356,19 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', authMW, (req, res) => {
   sessions.delete((req.headers.authorization || '').replace('Bearer ', ''));
   res.json({ ok: true });
+});
+
+// Mobile upload transport; Storage keeps the existing canonical binary format.
+app.post('/api/canvas/compressed', express.raw({ type: 'application/gzip', limit: '10mb' }), async (req, res) => {
+  try {
+    const snapshot = gunzipSync(req.body, { maxOutputLength: CANVAS_SIZE * CANVAS_SIZE });
+    if (snapshot.length !== CANVAS_SIZE * CANVAS_SIZE) return res.sendStatus(400);
+    const result = await supabaseRequest('/storage/v1/object/bplace/canvas.bin', 'POST', snapshot);
+    if (result.status !== 200 && result.status !== 201) return res.sendStatus(502);
+    res.sendStatus(200);
+  } catch (error) {
+    res.sendStatus(400);
+  }
 });
 
 // Compress the canonical cloud snapshot before sending it to mobile clients.
