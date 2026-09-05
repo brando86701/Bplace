@@ -1646,16 +1646,32 @@ body.paint-mode #wplace-dock {
 @media (max-width: 768px) {
   /* Top Bar Mobile Optimization */
   #topbar {
-    top: 6px;
+    top: calc(6px + env(safe-area-inset-top, 0px));
     left: 6px;
     right: 6px;
-    gap: 4px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
   }
   
   .tb-floating-left, .tb-floating-right {
     padding: 4px 8px;
     gap: 4px;
     border-radius: var(--radius-full);
+    max-width: 100%;
+    box-sizing: border-box;
+    justify-content: center;
+  }
+
+  .tb-floating-left {
+    border-radius: 20px;
+    flex-wrap: wrap;
+  }
+
+  .tb-info-chips {
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: center;
   }
   
   .tb-logo {
@@ -1669,6 +1685,10 @@ body.paint-mode #wplace-dock {
 
   .tb-btn {
     padding: 5px 7px;
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+    justify-content: center;
     font-size: 11px;
     gap: 0;
   }
@@ -1840,7 +1860,7 @@ body.paint-mode #wplace-dock {
   }
 
   .canvas-actions {
-    top: 64px;
+    top: calc(140px + env(safe-area-inset-top, 0px));
     right: 10px;
     gap: 9px;
   }
