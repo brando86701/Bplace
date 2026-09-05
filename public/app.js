@@ -307,6 +307,7 @@ function connectSupabaseRealtime() {
                 setupCanvas(tpl.origImage);
               } else if (tpl.origImageURL) {
                 const img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload = () => { tpl.origImage = img; setupCanvas(img); };
                 img.src = tpl.origImageURL;
               }
@@ -1231,7 +1232,11 @@ function loadTemplatesIDB() {
 
 function loadImg(src) {
   return new Promise((res, rej) => {
-    const img = new Image(); img.onload = () => res(img); img.onerror = rej; img.src = src;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => res(img);
+    img.onerror = (err) => rej(err || new Error('Image load failed'));
+    img.src = src;
   });
 }
 
@@ -1786,6 +1791,7 @@ function render() {
         ctx.drawImage(tpl.origImage, tx, ty, tw, th);
       } else if (tpl.origImageURL) {
         const img = new Image();
+        img.crossOrigin = 'anonymous';
         img.onload = () => { tpl.origImage = img; markDirty(); };
         img.src = tpl.origImageURL;
         tpl.origImage = img;
@@ -2713,6 +2719,7 @@ function renderTemplateList(){
     const div=document.createElement('div');div.className='tpl-item'+(tpl.confirmed?' confirmed':' pending')+(tpl.id===activePaintingTemplateId?' selected':'')+(tpl.remoteLoading?' loading':'');
     const thumbImg=document.createElement('img');
     thumbImg.className='tpl-item-thumb';
+    thumbImg.crossOrigin='anonymous';
     if (tpl.origImageURL) {
       thumbImg.src = tpl.origImageURL;
     } else if (tpl.origImage && tpl.origImage.src) {
