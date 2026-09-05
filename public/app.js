@@ -277,6 +277,7 @@ function connectSupabaseRealtime() {
             await addTemplateFromData(p.template);
             renderTemplateList();
             markDirty();
+            saveTemplatesToIDB();
           }
         } else if (ev === 'template_refresh' && p.id !== undefined) {
           ensureRemoteTemplatePlaceholder(p);
@@ -286,8 +287,10 @@ function connectSupabaseRealtime() {
           if (tpl && p.updates) {
             const needIndices = (p.updates.confirmed && !tpl.confirmed) || (!tpl.rawIndices && (tpl.confirmed || p.updates.confirmed));
             const sharedUpdates = { ...p.updates };
+            // Visibility and color filters are strictly independent per user
             delete sharedUpdates.filterCI;
             delete sharedUpdates.filterActive;
+            delete sharedUpdates.visible;
             Object.assign(tpl, sharedUpdates);
             if (needIndices) {
               tpl.confirmed = true;
@@ -480,6 +483,49 @@ async function addTemplateFromData(saved, list = templates) {
   }
 }
 
+async function uploadTemplateImageToStorage(tpl) {
+  if (!tpl) return '';
+  if (tpl.origImageURL && tpl.origImageURL.startsWith('http') && tpl.origImageURL.includes('/storage/v1/object/public/bplace/')) {
+    return tpl.origImageURL;
+  }
+  try {
+    const img = tpl.origImage || await loadImg(tpl.origImageURL);
+    const canvas = document.createElement('canvas');
+    let nw = img.naturalWidth || img.width || 400;
+    let nh = img.naturalHeight || img.height || 400;
+    const maxDim = 1200;
+    if (nw > maxDim || nh > maxDim) {
+      if (nw >= nh) { nh = Math.round(nh * (maxDim / nw)); nw = maxDim; }
+      else { nw = Math.round(nw * (maxDim / nh)); nh = maxDim; }
+    }
+    canvas.width = Math.max(10, nw);
+    canvas.height = Math.max(10, nh);
+    const cctx = canvas.getContext('2d');
+    cctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+    if (!blob) throw new Error('Blob creation failed');
+    
+    const res = await fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/templates/tpl_${tpl.id}.png`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_CONFIG.anonKey,
+        'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey,
+        'Content-Type': 'image/png',
+        'x-upsert': 'true'
+      },
+      body: blob
+    });
+    if (res.ok) {
+      const cdnUrl = `${SUPABASE_CONFIG.url}/storage/v1/object/public/bplace/templates/tpl_${tpl.id}.png?t=${Date.now()}`;
+      return cdnUrl;
+    }
+  } catch (err) {
+    console.warn('[Storage] Error subiendo imagen de plantilla:', err);
+  }
+  return tpl.origImageURL;
+}
+
 function sendTemplateUpdate(tpl) {
   if (!tpl || tpl.draft) return;
   const updates = {
@@ -488,7 +534,6 @@ function sendTemplateUpdate(tpl) {
     w: tpl.w,
     h: tpl.h,
     opacity: tpl.opacity,
-    visible: tpl.visible,
     confirmed: tpl.confirmed
   };
 
@@ -506,7 +551,7 @@ function sendTemplateUpdate(tpl) {
     });
   }
 
-  // 2. Debounce persist to Supabase PostgreSQL table (prevents HTTP spam during dragging/resizing)
+  // 2. Debounce persist to Supabase PostgreSQL table
   debounceTemplateRestUpdate(tpl);
 }
 
@@ -527,7 +572,6 @@ function debounceTemplateRestUpdate(tpl) {
         w: tpl.w,
         h: tpl.h,
         opacity: tpl.opacity,
-        visible: tpl.visible,
         confirmed: tpl.confirmed
       })
     }).catch(() => {});
@@ -572,6 +616,15 @@ function deleteTemplate(tplId) {
       'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey
     }
   }).catch(() => {});
+
+  // 3. Delete from Supabase Storage CDN
+  fetch(`${SUPABASE_CONFIG.url}/storage/v1/object/bplace/templates/tpl_${tplId}.png`, {
+    method: 'DELETE',
+    headers: {
+      'apikey': SUPABASE_CONFIG.anonKey,
+      'Authorization': 'Bearer ' + SUPABASE_CONFIG.anonKey
+    }
+  }).catch(() => {});
 }
 
 async function loadTemplatesFromCloud() {
@@ -584,11 +637,19 @@ async function loadTemplatesFromCloud() {
     });
     if (res.ok) {
       const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
+      if (Array.isArray(data)) {
+        if (data.length === 0) {
+          templates = [];
+          renderTemplateList();
+          markDirty();
+          saveTemplatesToIDB();
+          return true;
+        }
         const loadedList = [];
         for (let i = 0; i < data.length; i++) {
           const t = data[i];
-          // Yield to event loop between templates so UI / zoom / pan never freezes!
+          const existing = templates.find(e => String(e.id) === String(t.id));
+          const localVis = existing ? (existing.visible !== false) : true;
           await new Promise(r => setTimeout(r, 0));
           await addTemplateFromData({
             id: Number(t.id),
@@ -599,7 +660,7 @@ async function loadTemplatesFromCloud() {
             w: t.w,
             h: t.h,
             opacity: t.opacity,
-            visible: t.visible,
+            visible: localVis,
             confirmed: t.confirmed
           }, loadedList);
         }
@@ -2565,11 +2626,11 @@ function setCanvasLocked(locked, notify = true) {
 }
 
 async function publishTemplate(tpl) {
-  // A Base64 image can be several MB and exceed the realtime message limit.
-  // Broadcast only the id; every device downloads the persisted row by HTTP.
-  announceTemplateRefresh(tpl);
-  sendTemplateUpdate(tpl);
+  showToast('Sincronizando plantilla...', '');
   try {
+    const cdnUrl = await uploadTemplateImageToStorage(tpl);
+    if (cdnUrl) tpl.origImageURL = cdnUrl;
+
     const res = await fetch(`${SUPABASE_CONFIG.url}/rest/v1/templates`, {
       method: 'POST',
       headers: {
@@ -2579,19 +2640,53 @@ async function publishTemplate(tpl) {
         'Prefer': 'resolution=merge-duplicates'
       },
       body: JSON.stringify({
-        id: tpl.id, name: tpl.name, orig_image_url: tpl.origImageURL,
-        x: tpl.x, y: tpl.y, w: tpl.w, h: tpl.h,
-        opacity: tpl.opacity, visible: tpl.visible,
-        confirmed: true, filter_ci: -1
+        id: tpl.id,
+        name: tpl.name,
+        orig_image_url: tpl.origImageURL,
+        x: tpl.x,
+        y: tpl.y,
+        w: tpl.w,
+        h: tpl.h,
+        opacity: tpl.opacity,
+        visible: true,
+        confirmed: true,
+        filter_ci: -1
       })
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    // A second lightweight notification closes the race with the database write.
+
+    // Broadcast template_add with lightweight CDN URL
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      sendRealtime({
+        topic: 'realtime:bplace',
+        event: 'broadcast',
+        payload: {
+          type: 'broadcast',
+          event: 'template_add',
+          payload: {
+            template: {
+              id: tpl.id,
+              name: tpl.name,
+              origImageURL: tpl.origImageURL,
+              x: tpl.x,
+              y: tpl.y,
+              w: tpl.w,
+              h: tpl.h,
+              opacity: tpl.opacity,
+              confirmed: true
+            }
+          }
+        },
+        ref: String(sbMsgRef++)
+      });
+    }
+
     announceTemplateRefresh(tpl);
     sendTemplateUpdate(tpl);
+    showToast('Plantilla sincronizada para todos', 'success');
   } catch (err) {
     console.warn('[Supabase] Error saving template:', err);
-    showToast('La plantilla quedó local; revisa la conexión', 'error');
+    showToast('Plantilla guardada localmente', 'info');
   }
 }
 
@@ -2689,8 +2784,9 @@ function renderTemplateList(){
     div.querySelector('[data-act="vis"]').addEventListener('click',e=>{
       e.stopPropagation();
       tpl.visible=!tpl.visible;
-      renderTemplateList();markDirty();scheduleTemplateSave();
-      sendTemplateUpdate(tpl);
+      renderTemplateList();
+      markDirty();
+      saveTemplatesToIDB();
     });
     div.querySelector('[data-act="del"]').addEventListener('click',e=>{
       e.stopPropagation();

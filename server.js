@@ -968,6 +968,7 @@ function connectServerToSupabaseRealtime() {
           } else if (ev === 'template_update' && p && p.id && p.updates) {
             delete p.updates.filterCI;
             delete p.updates.filterActive;
+            delete p.updates.visible;
             const tpl = serverTemplates.find(t => t.id === p.id);
             if (tpl) {
               Object.assign(tpl, p.updates);
